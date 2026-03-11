@@ -1,4 +1,4 @@
-# FSDB: Filesystem Database Overlay
+# FADOS: Filesystem Database Overlay
 
 ## Vision
 
@@ -12,7 +12,7 @@ owning the data. The filesystem is ground truth. The index is disposable and alw
 1. **Non-destructive** — no files are moved, renamed, or modified. Metadata lives in sidecars or
    a shadow tree.
 2. **Reconstructible** — the index can be blown away and rebuilt entirely from the source tree.
-3. **Transparent** — the tree remains usable by all other tools. FSDB is a lens, not a lock-in.
+3. **Transparent** — the tree remains usable by all other tools. FADOS is a lens, not a lock-in.
 4. **Agent-friendly** — query interface designed for LLM agent consumption (structured output,
    path-addressable results, tool-call ergonomics).
 
@@ -137,7 +137,7 @@ based on result set size and index freshness.
 ## Indexing Pipeline
 
 ### Triggers
-- Manual: `fsdb index /path`
+- Manual: `fados index /path`
 - Incremental: `inotifywait` watches the tree, queues changed paths
 - Scheduled: cron-based full scan to catch missed events
 
@@ -183,7 +183,7 @@ Two options, non-exclusive:
 
 **Option A: Shadow tree**
 ```
-~/.fsdb/meta/
+~/.fados/meta/
     projects/
         my-project/
             README.md.meta.json
@@ -193,7 +193,7 @@ Two options, non-exclusive:
 ```
 /projects/my-project/
     README.md
-    .README.md.fsdb.json    ← hidden, travels with the file
+    .README.md.fados.json    ← hidden, travels with the file
 ```
 
 Shadow tree is cleaner (source tree untouched). Inline sidecars survive copies/moves.
@@ -206,16 +206,16 @@ Both supported; shadow tree is default.
 Designed as MCP tool calls or HTTP endpoints, returning structured JSON:
 
 ```
-fsdb_query(sql)          → [{path, mime, mtime, snippet, ...}]
-fsdb_read(path)          → {content, metadata, tags}
-fsdb_tag(path, tag)      → ok
-fsdb_annotate(path, key, value) → ok
-fsdb_similar(path, n)    → [{path, score}]   ← embedding-based, optional
+fados_query(sql)          → [{path, mime, mtime, snippet, ...}]
+fados_read(path)          → {content, metadata, tags}
+fados_tag(path, tag)      → ok
+fados_annotate(path, key, value) → ok
+fados_similar(path, n)    → [{path, score}]   ← embedding-based, optional
 ```
 
 Result records always include `path` — agents can reference files directly.
 
-`fsdb_similar` is an optional layer: embed extracted content, store in a vector sidecar
+`fados_similar` is an optional layer: embed extracted content, store in a vector sidecar
 (sqlite-vec or hnswlib), enable semantic search alongside keyword search.
 
 ---
@@ -237,7 +237,7 @@ suggests tagging rules and display hints.
 ## Implementation Phases
 
 ### Phase 1 — Core index
-- `fsdb index <path>` builds SQLite index
+- `fados index <path>` builds SQLite index
 - Basic SQL query interface
 - File watcher for incremental updates
 
@@ -248,11 +248,11 @@ suggests tagging rules and display hints.
 
 ### Phase 3 — Agent interface
 - HTTP API / MCP tool definitions
-- `fsdb_read`, `fsdb_query`, `fsdb_tag`, `fsdb_annotate`
+- `fados_read`, `fados_query`, `fados_tag`, `fados_annotate`
 
 ### Phase 4 — Semantic layer (optional)
 - Embedding extraction on indexed content
-- `fsdb_similar` via sqlite-vec
+- `fados_similar` via sqlite-vec
 
 ---
 
