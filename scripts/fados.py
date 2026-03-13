@@ -22,6 +22,7 @@ Commands:
 
 import sys
 import os
+import re
 import sqlite3
 import subprocess
 import json
@@ -34,6 +35,7 @@ import argparse
 
 # --- Config ---
 
+IGNORE_DIRS = {".git", ".fados", "__pycache__", "node_modules", "target", ".venv"}
 USER_FADOS_DIR = Path.home() / ".fados"
 
 def _find_local_fados_dir() -> Optional[Path]:
@@ -53,7 +55,7 @@ MAX_AUTO_INDEX_ENTRIES = 10_000
 
 def _count_tree(root: Path, limit: int) -> int:
     """Count files under root, stopping early once limit is exceeded."""
-    ignore = {".git", ".fados", "__pycache__", "node_modules", "target", ".venv"}
+    ignore = IGNORE_DIRS
     count = 0
     for path in root.rglob("*"):
         if any(part in ignore for part in path.parts):
@@ -248,7 +250,7 @@ def index_file(con: sqlite3.Connection, path: Path, force: bool = False):
 
 def index_tree(root: Path, fados_dir: Path, force: bool = False):
     con = db_connect(fados_dir)
-    IGNORE = {".git", ".fados", "__pycache__", "node_modules", ".venv"}
+    IGNORE = IGNORE_DIRS
     count = 0
     errors = 0
     for path in root.rglob("*"):
@@ -444,8 +446,8 @@ def main():
     ap = argparse.ArgumentParser(prog="fados", description="Filesystem As Database Overlay System")
     ap.add_argument("--user", action="store_true",
                     help="use ~/.fados/ instead of local .fados/ in the indexed tree")
-    ap.add_argument("--path", type=str, default=None,
-                    help="target directory to search (uses <path>/.fados/ for the index)")
+    ap.add_argument("--dir", type=str, default=None,
+                    help="target directory to search (uses <dir>/.fados/ for the index)")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("reindex");  p.add_argument("path"); p.add_argument("--embed", action="store_true")
@@ -470,7 +472,7 @@ def main():
     # Other commands discover .fados/ by walking up from CWD (or use --path).
     has_target = args.cmd in ("reindex", "embed", "watch")
     target = Path(args.path) if has_target else None
-    path_override = Path(args.path) if args.path else None
+    path_override = Path(args.dir) if args.dir else None
     fados_dir = resolve_fados_dir(user=args.user, target=target,
                                   path_override=path_override)
 
