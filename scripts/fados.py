@@ -7,7 +7,6 @@ FADOS - Filesystem As Database Overlay System
 Single-file prototype. Run with: uv run fados.py <command> [args]
 
 Commands:
-  index <path> [--embed]    index a directory tree (--embed also generates vector embeddings)
   reindex <path> [--embed]  force full reindex
   embed <path>              generate/refresh semantic embeddings for indexed content
   query <sql>               raw SQL against the index
@@ -392,10 +391,6 @@ def main():
     args = ap.parse_args()
 
     match args.cmd:
-        case "index":
-            index_tree(Path(args.path))
-            if args.embed:
-                embed_tree(Path(args.path))
         case "reindex":
             index_tree(Path(args.path), force=True)
             if args.embed:
