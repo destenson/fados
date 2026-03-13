@@ -18,6 +18,7 @@ index is always rebuildable from the source tree.
 
 **Python dependencies** (managed automatically by `uv`):
 
+- `click`
 - `python-magic`
 
 **Optional** (for semantic search):
@@ -51,17 +52,17 @@ Use `--user` to store the index at `~/.fados/index.db` instead.
 ## Commands
 
 ```
-Global flags:
-  --user                 Use ~/.fados/ instead of local .fados/ in the indexed tree.
-  --dir <path>           Target directory to search (uses <dir>/.fados/ for the index).
+Global flags (before any command):
+  --user           Use ~/.fados/ instead of local .fados/ in the indexed tree.
+  --dir <path>     Target directory (uses <dir>/.fados/ for the index). Applies to all commands.
 
 Index-based commands:
-  reindex <path> [--embed]  Force a full rebuild of the index. Indexing is automatic on first run.
-  embed <path>              Generate/refresh semantic embeddings for already-indexed content.
+  reindex [path] [--embed]  Force a full rebuild. Path overrides --dir. Auto-indexes on first run.
+  embed [path]              Generate/refresh semantic embeddings for indexed content.
   query <sql>               Raw SQL against the index database.
   search <terms>            Full-text keyword search (FTS5).
   semantic <query> [-n N]   Semantic/conceptual search using embeddings (default: top 20).
-  similar <path> [-n N]     Find files with similar content (default: top 10).
+  similar <file> [-n N]     Find files with similar content (default: top 10).
   find <key> <value>        Search metadata by key/value.
 
 Intent-based search (uses ripgrep, no index required):
@@ -71,10 +72,10 @@ Intent-based search (uses ripgrep, no index required):
   tests <term> [-n N]           Find references in test files.
 
 File info and annotation:
-  tag <path> <tag>          Add a user tag to a file.
-  annotate <path> <k> <v>   Add arbitrary user metadata to a file.
-  info <path>               Show all indexed data for a file.
-  watch <path>              Watch for changes and reindex incrementally (requires inotify-tools).
+  tag <file> <tag>          Add a user tag to a file.
+  annotate <file> <k> <v>   Add arbitrary user metadata to a file.
+  info <file>               Show all indexed data for a file.
+  watch [path]              Watch for changes and reindex incrementally (requires inotify-tools).
 ```
 
 ## Examples

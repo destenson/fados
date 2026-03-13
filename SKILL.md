@@ -6,7 +6,8 @@ The index is always rebuildable from the source tree.
 
 Indexing happens automatically on first run. The index is stored at `<path>/.fados/index.db`,
 colocated with the data. Query commands discover the index by walking up from CWD (git-style).
-Use `--user` to use `~/.fados/` instead.
+Use `--dir <path>` to target a specific directory, or `--user` to use `~/.fados/` instead.
+These flags go **before** the command: `uv run scripts/fados.py --dir /some/path search foo`.
 
 ## When to invoke
 
@@ -70,8 +71,8 @@ These are the fastest commands — they need no index, just `rg` installed.
 
 | Command | Purpose |
 |---------|---------|
-| `reindex [--embed]` | Force full reindex of the current tree |
-| `embed` | Generate/refresh semantic embeddings for already-indexed content |
+| `reindex [path] [--embed]` | Force full reindex (path overrides --dir) |
+| `embed [path]` | Generate/refresh semantic embeddings for indexed content |
 
 ---
 
