@@ -64,15 +64,19 @@ def _count_tree(root: Path, limit: int) -> int:
                 return count
     return count
 
-def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None) -> Path:
+def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None,
+                      path_override: Optional[Path] = None) -> Path:
     """Determine where .fados/ lives.
 
-    --user flag:  always ~/.fados/
-    reindex/embed/watch:  <target>/.fados/
-    other commands:  walk up from CWD to find .fados/, or CWD for auto-index
+    --user flag:      always ~/.fados/
+    --path override:  <path_override>/.fados/
+    reindex/embed/watch target:  <target>/.fados/
+    other commands:   walk up from CWD to find .fados/, or CWD for auto-index
     """
     if user:
         return USER_FADOS_DIR
+    if path_override is not None:
+        return path_override.resolve() / ".fados"
     if target is not None:
         return target.resolve() / ".fados"
     found = _find_local_fados_dir()
@@ -440,6 +444,8 @@ def main():
     ap = argparse.ArgumentParser(prog="fados", description="Filesystem As Database Overlay System")
     ap.add_argument("--user", action="store_true",
                     help="use ~/.fados/ instead of local .fados/ in the indexed tree")
+    ap.add_argument("--path", type=str, default=None,
+                    help="target directory to search (uses <path>/.fados/ for the index)")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("reindex");  p.add_argument("path"); p.add_argument("--embed", action="store_true")
@@ -461,10 +467,12 @@ def main():
         return
 
     # Commands that take a target path create .fados/ inside that path.
-    # Other commands discover .fados/ by walking up from CWD.
+    # Other commands discover .fados/ by walking up from CWD (or use --path).
     has_target = args.cmd in ("reindex", "embed", "watch")
     target = Path(args.path) if has_target else None
-    fados_dir = resolve_fados_dir(user=args.user, target=target)
+    path_override = Path(args.path) if args.path else None
+    fados_dir = resolve_fados_dir(user=args.user, target=target,
+                                  path_override=path_override)
 
     # Auto-index on first run (skip for reindex, which always indexes)
     if args.cmd != "reindex" and _needs_auto_index(fados_dir):
