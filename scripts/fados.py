@@ -4,7 +4,10 @@
 # ///
 """
 FADOS - Filesystem As Database Overlay System
-Single-file prototype. Run with: uv run fados.py <command> [args]
+Single-file prototype. Run with: uv run scripts/fados.py <command> [args]
+
+Auto-indexes CWD on first run. Index stored in <path>/.fados/index.db.
+Use --user for ~/.fados/ instead.
 
 Commands:
   reindex <path> [--embed]  force full reindex
@@ -41,21 +44,35 @@ def _find_local_fados_dir() -> Optional[Path]:
     home = Path.home()
     cur = Path.cwd().resolve()
     while True:
+        if cur == home or cur.parent == cur:
+            break
         candidate = cur / ".fados"
         if candidate.is_dir():
             return candidate
-        parent = cur.parent
-        if parent == cur or cur == home:
-            break
-        cur = parent
+        cur = cur.parent
     return None
+
+MAX_AUTO_INDEX_ENTRIES = 10_000
+
+def _count_tree(root: Path, limit: int) -> int:
+    """Count files under root, stopping early once limit is exceeded."""
+    ignore = {".git", ".fados", "__pycache__", "node_modules", "target", ".venv"}
+    count = 0
+    for path in root.rglob("*"):
+        if any(part in ignore for part in path.parts):
+            continue
+        if path.is_file():
+            count += 1
+            if count > limit:
+                return count
+    return count
 
 def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None) -> Path:
     """Determine where .fados/ lives.
 
     --user flag:  always ~/.fados/
-    index/reindex/embed/watch:  <target>/.fados/
-    other commands:  walk up from CWD to find .fados/
+    reindex/embed/watch:  <target>/.fados/
+    other commands:  walk up from CWD to find .fados/, or CWD for auto-index
     """
     if user:
         return USER_FADOS_DIR
@@ -64,10 +81,26 @@ def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None) -> P
     found = _find_local_fados_dir()
     if found:
         return found
-    print("error: no .fados/ index found (walk from CWD to /). "
-          "Run 'fados index <path>' first, or use --user for ~/.fados/.",
+    # No existing index — will auto-index from CWD
+    return Path.cwd().resolve() / ".fados"
+
+def _needs_auto_index(fados_dir: Path) -> bool:
+    """True if the index DB doesn't exist yet."""
+    return not (fados_dir / "index.db").exists()
+
+def _auto_index(fados_dir: Path):
+    """Auto-index CWD on first run. Bail if the tree is too large."""
+    root = fados_dir.parent
+    count = _count_tree(root, MAX_AUTO_INDEX_ENTRIES)
+    if count > MAX_AUTO_INDEX_ENTRIES:
+        print(f"error: {root} has more than {MAX_AUTO_INDEX_ENTRIES} files. "
+              f"Auto-indexing skipped to avoid a long wait.\n"
+              f"Run 'fados reindex {root}' to index explicitly.",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"no index found — auto-indexing {root} ({count} files)...",
           file=sys.stderr)
-    sys.exit(1)
+    index_tree(root, fados_dir)
 
 # --- DB setup ---
 
@@ -435,6 +468,10 @@ def main():
     has_target = args.cmd in ("reindex", "embed", "watch")
     target = Path(args.path) if has_target else None
     fados_dir = resolve_fados_dir(user=args.user, target=target)
+
+    # Auto-index on first run (skip for reindex, which always indexes)
+    if args.cmd != "reindex" and _needs_auto_index(fados_dir):
+        _auto_index(fados_dir)
 
     match args.cmd:
         case "reindex":
