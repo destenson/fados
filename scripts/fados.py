@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# dependencies = ["python-magic", "rich", "sentence-transformers", "numpy"]
-# ///
 """
 FADOS - Filesystem As Database Overlay System
 Single-file prototype. Run with: uv run scripts/fados.py <command> [args]

@@ -1,0 +1,17 @@
+[project]
+name = "fados"
+version = "0.1.0"
+description = "Filesystem As Database Overlay System"
+requires-python = ">=3.11"
+dependencies = [
+    "python-magic",
+    "rich",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "sentence-transformers",
+    "numpy",
+]
+
+# TODO: specify gpu-specific dependencies for sentence-transformers (torch, transformers, etc.) once we have a better sense of the landscape and requirements.
