@@ -203,7 +203,9 @@ Both supported; shadow tree is default.
 
 ## Agent Interface
 
-Designed as MCP tool calls or HTTP endpoints, returning structured JSON:
+The CLI is the primary interface. Agents invoke FADOS via `uv run scripts/fados.py <command>`.
+All commands return newline-delimited JSON with `path` in every result record, so agents can
+reference files directly.
 
 ```
 fados_query(sql)          → [{path, mime, mtime, snippet, ...}]
@@ -213,10 +215,11 @@ fados_annotate(path, key, value) → ok
 fados_similar(path, n)    → [{path, score}]   ← embedding-based, optional
 ```
 
-Result records always include `path` — agents can reference files directly.
-
 `fados_similar` is an optional layer: embed extracted content, store in a vector sidecar
 (sqlite-vec or hnswlib), enable semantic search alongside keyword search.
+
+> **Future**: An MCP server or HTTP API could wrap the CLI for tighter agent integration,
+> but this is low priority — the CLI works well enough for current use cases.
 
 ---
 
@@ -246,13 +249,13 @@ suggests tagging rules and display hints.
 - FTS5 full-text search
 - `rg`-based predicate pushdown
 
-### Phase 3 — Agent interface
-- HTTP API / MCP tool definitions
-- `fados_read`, `fados_query`, `fados_tag`, `fados_annotate`
-
-### Phase 4 — Semantic layer (optional)
+### Phase 3 — Semantic layer
 - Embedding extraction on indexed content
 - `fados_similar` via sqlite-vec
+
+### Phase 4 — Agent protocol integration (future, low priority)
+- MCP server wrapping the CLI
+- HTTP API for remote/networked access
 
 ---
 
