@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Filesystem As Database Overlay System"
 requires-python = ">=3.11"
 dependencies = [
+    "click",
     "python-magic",
 ]
 

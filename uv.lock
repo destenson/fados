@@ -87,6 +87,7 @@ name = "fados"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "click" },
     { name = "python-magic" },
 ]
 
@@ -98,6 +99,7 @@ semantic = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click" },
     { name = "numpy", marker = "extra == 'semantic'" },
     { name = "python-magic" },
     { name = "sentence-transformers", marker = "extra == 'semantic'" },

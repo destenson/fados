@@ -7,8 +7,8 @@ Auto-indexes CWD on first run. Index stored in <path>/.fados/index.db.
 Use --user for ~/.fados/ instead.
 
 Commands:
-  reindex <path> [--embed]  force full reindex
-  embed <path>              generate/refresh semantic embeddings for indexed content
+  reindex [--embed]         force full reindex
+  embed                     generate/refresh semantic embeddings for indexed content
   query <sql>               raw SQL against the index
   search <terms>            full-text keyword search (FTS5)
   semantic <query> [-n N]   semantic/conceptual search using embeddings (default n=20)
@@ -21,7 +21,7 @@ Commands:
   tag <path> <tag>          add a user tag
   annotate <path> <k> <v>   add user metadata
   info <path>               show all indexed info for a file
-  watch <path>              watch for changes and reindex (requires inotify-tools)
+  watch                     watch for changes and reindex (requires inotify-tools)
 """
 
 import sys
@@ -35,7 +35,8 @@ import time
 import mimetypes
 from pathlib import Path
 from typing import Optional
-import argparse
+
+import click
 
 # --- Config ---
 
@@ -70,21 +71,18 @@ def _count_tree(root: Path, limit: int) -> int:
                 return count
     return count
 
-def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None,
-                      path_override: Optional[Path] = None) -> Path:
+def resolve_fados_dir(*, user: bool = False,
+                      dir_override: Optional[Path] = None) -> Path:
     """Determine where .fados/ lives.
 
-    --user flag:      always ~/.fados/
-    --path override:  <path_override>/.fados/
-    reindex/embed/watch target:  <target>/.fados/
-    other commands:   walk up from CWD to find .fados/, or CWD for auto-index
+    --user flag:    always ~/.fados/
+    --dir override: <dir>/.fados/
+    default:        walk up from CWD to find .fados/, or CWD/.fados/ for auto-index
     """
     if user:
         return USER_FADOS_DIR
-    if path_override is not None:
-        return path_override.resolve() / ".fados"
-    if target is not None:
-        return target.resolve() / ".fados"
+    if dir_override is not None:
+        return dir_override.resolve() / ".fados"
     found = _find_local_fados_dir()
     if found:
         return found
@@ -524,88 +522,202 @@ def print_results(rows: list):
     for row in rows:
         print(json.dumps(row, default=str))
 
-def main():
-    ap = argparse.ArgumentParser(prog="fados", description="Filesystem As Database Overlay System")
-    ap.add_argument("--user", action="store_true",
-                    help="use ~/.fados/ instead of local .fados/ in the indexed tree")
-    ap.add_argument("--dir", type=str, default=None,
-                    help="target directory to search (uses <dir>/.fados/ for the index)")
-    sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("reindex");  p.add_argument("path"); p.add_argument("--embed", action="store_true")
-    p = sub.add_parser("embed");    p.add_argument("path", help="root path whose indexed content to embed")
-    p = sub.add_parser("query");    p.add_argument("sql")
-    p = sub.add_parser("search");   p.add_argument("terms", nargs="+")
-    p = sub.add_parser("semantic"); p.add_argument("query", nargs="+"); p.add_argument("-n", type=int, default=20)
-    p = sub.add_parser("similar");  p.add_argument("path"); p.add_argument("-n", type=int, default=10)
-    p = sub.add_parser("find");     p.add_argument("key"); p.add_argument("value")
-    p = sub.add_parser("tag");      p.add_argument("path"); p.add_argument("tag")
-    p = sub.add_parser("annotate"); p.add_argument("path"); p.add_argument("key"); p.add_argument("value")
-    p = sub.add_parser("info");     p.add_argument("path")
-    p = sub.add_parser("watch");    p.add_argument("path")
-    p = sub.add_parser("definition"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
-    p = sub.add_parser("implementation"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
-    p = sub.add_parser("documentation"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
-    p = sub.add_parser("tests"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
+class Context:
+    """Resolved --dir/--user into fados_dir and root for all subcommands."""
+    def __init__(self, fados_dir: Path):
+        self.fados_dir = fados_dir
+        self.root = fados_dir.parent
 
-    args = ap.parse_args()
+    def auto_index_if_needed(self):
+        if _needs_auto_index(self.fados_dir):
+            _auto_index(self.fados_dir)
 
-    if not args.cmd:
-        ap.print_help()
-        return
 
-    # Commands that take a target path create .fados/ inside that path.
-    # Other commands discover .fados/ by walking up from CWD (or use --path).
-    has_target = args.cmd in ("reindex", "embed", "watch")
-    target = Path(args.path) if has_target else None
-    path_override = Path(args.dir) if args.dir else None
-    fados_dir = resolve_fados_dir(user=args.user, target=target,
-                                  path_override=path_override)
+pass_ctx = click.make_pass_decorator(Context)
 
-    # Intent-based search uses ripgrep directly, no index needed
-    RG_COMMANDS = {"definition", "implementation", "documentation", "tests"}
 
-    # Auto-index on first run (skip for reindex and rg-based commands)
-    if args.cmd not in ("reindex", *RG_COMMANDS) and _needs_auto_index(fados_dir):
-        _auto_index(fados_dir)
+@click.group()
+@click.option("--user", is_flag=True, help="Use ~/.fados/ instead of local .fados/.")
+@click.option("--dir", "dir_", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=None, help="Target directory (uses <dir>/.fados/ for the index).")
+@click.pass_context
+def cli(ctx, user, dir_):
+    """FADOS — Filesystem As Database Overlay System."""
+    ctx.ensure_object(dict)
+    # Store raw values; subcommands with a path arg can override before resolving
+    ctx.obj["user"] = user
+    ctx.obj["dir"] = dir_
 
-    match args.cmd:
-        case "reindex":
-            index_tree(Path(args.path), fados_dir, force=True)
-            if args.embed:
-                embed_tree(Path(args.path), fados_dir)
-        case "embed":
-            embed_tree(Path(args.path), fados_dir)
-        case "query":
-            print_results(query(args.sql, fados_dir))
-        case "search":
-            print_results(search(" ".join(args.terms), fados_dir))
-        case "semantic":
-            print_results(semantic(" ".join(args.query), fados_dir, args.n))
-        case "similar":
-            print_results(similar(args.path, fados_dir, args.n))
-        case "find":
-            print_results(find_meta(args.key, args.value, fados_dir))
-        case "tag":
-            tag(args.path, args.tag, fados_dir)
-        case "annotate":
-            annotate(args.path, args.key, args.value, fados_dir)
-        case "info":
-            print(json.dumps(info(args.path, fados_dir), indent=2, default=str))
-        case "watch":
-            watch(Path(args.path), fados_dir)
-        case "definition" | "implementation" | "documentation" | "tests":
-            root = fados_dir.parent
-            func = {
-                "definition": search_definition,
-                "implementation": search_implementation,
-                "documentation": search_documentation,
-                "tests": search_tests,
-            }[args.cmd]
-            print_results(func(args.term, root, args.n))
-        case _:
-            ap.print_help()
+
+def _resolve_ctx(ctx, path_override: Optional[Path] = None) -> Context:
+    """Build Context, letting a subcommand's positional path override --dir."""
+    dir_override = path_override or ctx.obj["dir"]
+    fados_dir = resolve_fados_dir(user=ctx.obj["user"], dir_override=dir_override)
+    return Context(fados_dir)
+
+
+# --- Index commands (optional positional path, defaults to --dir / CWD) ---
+
+@cli.command()
+@click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--embed", "do_embed", is_flag=True, help="Also generate embeddings.")
+@click.pass_context
+def reindex(ctx, path, do_embed):
+    """Force a full reindex of the tree."""
+    c = _resolve_ctx(ctx, path)
+    index_tree(c.root, c.fados_dir, force=True)
+    if do_embed:
+        embed_tree(c.root, c.fados_dir)
+
+
+@cli.command()
+@click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.pass_context
+def embed(ctx, path):
+    """Generate/refresh semantic embeddings for indexed content."""
+    c = _resolve_ctx(ctx, path)
+    embed_tree(c.root, c.fados_dir)
+
+
+@cli.command("watch")
+@click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.pass_context
+def watch_cmd(ctx, path):
+    """Watch for changes and reindex incrementally (requires inotify-tools)."""
+    c = _resolve_ctx(ctx, path)
+    watch(c.root, c.fados_dir)
+
+
+# --- Index-based search ---
+
+@cli.command("query")
+@click.argument("sql")
+@click.pass_context
+def query_cmd(ctx, sql):
+    """Raw SQL against the index database."""
+    c = _resolve_ctx(ctx)
+    c.auto_index_if_needed()
+    print_results(query(sql, c.fados_dir))
+
+
+@cli.command("search")
+@click.argument("terms", nargs=-1, required=True)
+@click.pass_context
+def search_cmd(ctx, terms):
+    """Full-text keyword search (FTS5)."""
+    c = _resolve_ctx(ctx)
+    c.auto_index_if_needed()
+    print_results(search(" ".join(terms), c.fados_dir))
+
+
+@cli.command("semantic")
+@click.argument("terms", nargs=-1, required=True)
+@click.option("-n", default=20, help="Max results.")
+@click.pass_context
+def semantic_cmd(ctx, terms, n):
+    """Semantic/conceptual search using embeddings."""
+    c = _resolve_ctx(ctx)
+    c.auto_index_if_needed()
+    print_results(semantic(" ".join(terms), c.fados_dir, n))
+
+
+@cli.command("similar")
+@click.argument("file", type=click.Path())
+@click.option("-n", default=10, help="Max results.")
+@click.pass_context
+def similar_cmd(ctx, file, n):
+    """Find files with similar content to a given file."""
+    c = _resolve_ctx(ctx)
+    c.auto_index_if_needed()
+    print_results(similar(file, c.fados_dir, n))
+
+
+@cli.command("find")
+@click.argument("key")
+@click.argument("value")
+@click.pass_context
+def find_cmd(ctx, key, value):
+    """Search metadata by key/value."""
+    c = _resolve_ctx(ctx)
+    c.auto_index_if_needed()
+    print_results(find_meta(key, value, c.fados_dir))
+
+
+# --- Intent-based search (ripgrep, no index) ---
+
+@cli.command()
+@click.argument("term")
+@click.option("-n", default=20, help="Max results.")
+@click.pass_context
+def definition(ctx, term, n):
+    """Find where a term is defined (class, function, type, const, etc.)."""
+    c = _resolve_ctx(ctx)
+    print_results(search_definition(term, c.root, n))
+
+
+@cli.command()
+@click.argument("term")
+@click.option("-n", default=20, help="Max results.")
+@click.pass_context
+def implementation(ctx, term, n):
+    """Find usage in code (excludes tests and docs)."""
+    c = _resolve_ctx(ctx)
+    print_results(search_implementation(term, c.root, n))
+
+
+@cli.command()
+@click.argument("term")
+@click.option("-n", default=20, help="Max results.")
+@click.pass_context
+def documentation(ctx, term, n):
+    """Find references in docs (markdown, rst, etc.)."""
+    c = _resolve_ctx(ctx)
+    print_results(search_documentation(term, c.root, n))
+
+
+@cli.command()
+@click.argument("term")
+@click.option("-n", default=20, help="Max results.")
+@click.pass_context
+def tests(ctx, term, n):
+    """Find references in test files."""
+    c = _resolve_ctx(ctx)
+    print_results(search_tests(term, c.root, n))
+
+
+# --- File info and annotation ---
+
+@cli.command("tag")
+@click.argument("file", type=click.Path())
+@click.argument("tag_name", metavar="TAG")
+@click.pass_context
+def tag_cmd(ctx, file, tag_name):
+    """Add a user tag to a file."""
+    c = _resolve_ctx(ctx)
+    tag(file, tag_name, c.fados_dir)
+
+
+@cli.command("annotate")
+@click.argument("file", type=click.Path())
+@click.argument("key")
+@click.argument("value")
+@click.pass_context
+def annotate_cmd(ctx, file, key, value):
+    """Add arbitrary metadata to a file."""
+    c = _resolve_ctx(ctx)
+    annotate(file, key, value, c.fados_dir)
+
+
+@cli.command("info")
+@click.argument("file", type=click.Path())
+@click.pass_context
+def info_cmd(ctx, file):
+    """Show all indexed data for a file."""
+    c = _resolve_ctx(ctx)
+    print(json.dumps(info(file, c.fados_dir), indent=2, default=str))
+
 
 if __name__ == "__main__":
-    main()
+    cli()
 
