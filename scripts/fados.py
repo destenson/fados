@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["python-magic", "rich"]
+# dependencies = ["python-magic", "rich", "sentence-transformers", "numpy"]
 # ///
 """
 FADOS - Filesystem As Database Overlay System
 Single-file prototype. Run with: uv run fados.py <command> [args]
 
 Commands:
-  index <path>              index a directory tree
-  reindex <path>            force full reindex
+  index <path> [--embed]    index a directory tree (--embed also generates vector embeddings)
+  reindex <path> [--embed]  force full reindex
+  embed <path>              generate/refresh semantic embeddings for indexed content
   query <sql>               raw SQL against the index
-  search <terms>            full-text search
+  search <terms>            full-text keyword search (FTS5)
+  semantic <query> [-n N]   semantic/conceptual search using embeddings (default n=20)
+  similar <path> [-n N]     find files with similar content (default n=10)
   find <key> <value>        search metadata
   tag <path> <tag>          add a user tag
   annotate <path> <k> <v>   add user metadata
@@ -60,6 +63,10 @@ CREATE TABLE IF NOT EXISTS tags (
     PRIMARY KEY (path, tag)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS content USING fts5(path UNINDEXED, text);
+CREATE TABLE IF NOT EXISTS embeddings (
+    path    TEXT PRIMARY KEY,
+    vector  BLOB
+);
 CREATE INDEX IF NOT EXISTS idx_meta_key ON metadata(key, value);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 """
@@ -99,7 +106,14 @@ def extract_text(path: Path, mime: str) -> Optional[str]:
     if mime.startswith("text/"):
         return path.read_text(errors="replace")
     if mime == "application/pdf":
-        return run(["pdftotext", "-"], path)  # pdftotext reads from arg, writes to stdout with -
+        try:
+            result = subprocess.run(
+                ["pdftotext", str(path), "-"],
+                capture_output=True, text=True, timeout=30
+            )
+            return result.stdout.strip() or None
+        except Exception:
+            return None
     if mime in ("application/msword",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
         return run(["pandoc", "--to=plain"], path)
@@ -214,6 +228,91 @@ def find_meta(key: str, value: str):
         (key, f"%{value}%")
     )
 
+# --- Vector / semantic search ---
+
+_model = None
+
+def _get_model():
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
+
+def _embed(text: str) -> bytes:
+    import numpy as np
+    vec = _get_model().encode(text[:8192], normalize_embeddings=True)
+    return vec.astype(np.float32).tobytes()
+
+def _store_embedding(con: sqlite3.Connection, path: Path, text: str):
+    vec_bytes = _embed(text)
+    con.execute(
+        "INSERT OR REPLACE INTO embeddings(path, vector) VALUES (?,?)",
+        (str(path), vec_bytes)
+    )
+
+def embed_tree(root: Path):
+    """Generate / refresh embeddings for all indexed text content under root."""
+    import numpy as np
+    con = db_connect()
+    rows = con.execute(
+        "SELECT c.path, c.text FROM content c "
+        "JOIN files f ON f.path = c.path "
+        "WHERE f.path LIKE ?",
+        (str(root.resolve()) + "%",)
+    ).fetchall()
+    total = len(rows)
+    print(f"embedding {total} files...")
+    errors = 0
+    for i, row in enumerate(rows, 1):
+        try:
+            _store_embedding(con, Path(row["path"]), row["text"])
+            if i % 10 == 0:
+                con.commit()
+                print(f"  {i}/{total}", end="\r", flush=True)
+        except Exception as e:
+            errors += 1
+            print(f"  error {row['path']}: {e}", file=sys.stderr)
+    con.commit()
+    con.close()
+    print(f"\nembedded {total - errors} files ({errors} errors)")
+
+def semantic(query_text: str, n: int = 20) -> list:
+    """Semantic search using cosine similarity over stored embeddings."""
+    import numpy as np
+    q_vec = np.frombuffer(_embed(query_text), dtype=np.float32)
+    con = db_connect()
+    rows = con.execute("SELECT path, vector FROM embeddings").fetchall()
+    con.close()
+    if not rows:
+        return []
+    scores = []
+    for row in rows:
+        v = np.frombuffer(row["vector"], dtype=np.float32)
+        scores.append((float(np.dot(q_vec, v)), row["path"]))
+    scores.sort(reverse=True)
+    return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
+
+def similar(path: str, n: int = 10) -> list:
+    """Find files with content similar to the given path."""
+    import numpy as np
+    con = db_connect()
+    row = con.execute("SELECT vector FROM embeddings WHERE path=?", (path,)).fetchone()
+    if not row:
+        con.close()
+        return []
+    q_vec = np.frombuffer(row["vector"], dtype=np.float32)
+    rows = con.execute(
+        "SELECT path, vector FROM embeddings WHERE path!=?", (path,)
+    ).fetchall()
+    con.close()
+    scores = [
+        (float(np.dot(q_vec, np.frombuffer(r["vector"], dtype=np.float32))), r["path"])
+        for r in rows
+    ]
+    scores.sort(reverse=True)
+    return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
+
 # --- Mutations ---
 
 def tag(path: str, tag: str):
@@ -277,10 +376,13 @@ def main():
     ap = argparse.ArgumentParser(prog="fados", description="Filesystem As Database Overlay System")
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("index");    p.add_argument("path")
-    p = sub.add_parser("reindex");  p.add_argument("path")
+    p = sub.add_parser("index");    p.add_argument("path"); p.add_argument("--embed", action="store_true", help="also generate semantic embeddings")
+    p = sub.add_parser("reindex");  p.add_argument("path"); p.add_argument("--embed", action="store_true")
+    p = sub.add_parser("embed");    p.add_argument("path", help="root path whose indexed content to embed")
     p = sub.add_parser("query");    p.add_argument("sql")
     p = sub.add_parser("search");   p.add_argument("terms", nargs="+")
+    p = sub.add_parser("semantic"); p.add_argument("query", nargs="+"); p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("similar");  p.add_argument("path"); p.add_argument("-n", type=int, default=10)
     p = sub.add_parser("find");     p.add_argument("key"); p.add_argument("value")
     p = sub.add_parser("tag");      p.add_argument("path"); p.add_argument("tag")
     p = sub.add_parser("annotate"); p.add_argument("path"); p.add_argument("key"); p.add_argument("value")
@@ -292,12 +394,22 @@ def main():
     match args.cmd:
         case "index":
             index_tree(Path(args.path))
+            if args.embed:
+                embed_tree(Path(args.path))
         case "reindex":
             index_tree(Path(args.path), force=True)
+            if args.embed:
+                embed_tree(Path(args.path))
+        case "embed":
+            embed_tree(Path(args.path))
         case "query":
             print_results(query(args.sql))
         case "search":
             print_results(search(" ".join(args.terms)))
+        case "semantic":
+            print_results(semantic(" ".join(args.query), args.n))
+        case "similar":
+            print_results(similar(args.path, args.n))
         case "find":
             print_results(find_meta(args.key, args.value))
         case "tag":
