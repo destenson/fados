@@ -1,8 +1,11 @@
 # FADOS — Filesystem As Database Overlay
 
-FADOS indexes a local directory tree into a disposable SQLite database, enabling full-text,
-metadata, SQL, and semantic (vector) search over files — without moving or modifying them.
+FADOS indexes the current working directory into a disposable SQLite database, enabling
+full-text, metadata, and semantic (vector) search over files — without moving or modifying them.
 The index is always rebuildable from the source tree.
+
+Indexing happens automatically on first run. If the tree is large enough that indexing would
+be slow, the script prints a warning and exits with instructions on how to force it.
 
 ## When to invoke
 
@@ -16,45 +19,28 @@ Do **not** use FADOS to read or write file content — use standard file tools f
 
 ---
 
-## Setup (one-time per collection)
+## Running
+
+All commands are run from the directory you want to search:
 
 ```bash
-# Fast index (keyword + metadata search only)
-uv run scripts/fados.py index /path/to/collection
-
-# Index + generate semantic embeddings (enables semantic/similar commands; slower)
-uv run scripts/fados.py index /path/to/collection --embed
-
-# Add embeddings to an already-indexed tree
-uv run scripts/fados.py embed /path/to/collection
+uv run scripts/fados.py <command> [args]
 ```
 
-The `all-MiniLM-L6-v2` embedding model (~80 MB) is downloaded automatically on first use.
-Index lives at `~/.fados/index.db` — safe to delete; rebuilt with `reindex`.
+The script path is relative to this SKILL.md file.
 
 ---
 
 ## Commands
 
-All commands: `uv run scripts/fados.py <command> [args]`
-
-### Indexing
-
-| Command | Purpose |
-|---------|---------|
-| `index <path> [--embed]` | Index a directory tree |
-| `reindex <path> [--embed]` | Force full reindex of a tree |
-| `embed <path>` | Generate/refresh semantic embeddings only |
-| `watch <path>` | Watch for file changes and auto-reindex (requires `inotify-tools`) |
-
 ### Searching
 
 | Command | Purpose |
 |---------|---------|
-| `search <terms>` | Full-text keyword search (FTS5, fast) |
-| `semantic <query> [-n N]` | Semantic/conceptual search via embeddings (default n=20) |
+| `search <terms>` | Full-text keyword search (FTS5) |
+| `semantic <query> [-n N]` | Conceptual/meaning-based search via embeddings (default n=20) |
 | `similar <path> [-n N]` | Find files with similar content to a given file (default n=10) |
-| `query <sql>` | Raw SQL against the index |
+| `query <sql>` | SQL query against the index (see schema below) |
 | `find <key> <value>` | Search extracted/EXIF metadata by key+value |
 
 ### File info and annotation
@@ -65,17 +51,64 @@ All commands: `uv run scripts/fados.py <command> [args]`
 | `tag <path> <tag>` | Add a user tag to a file |
 | `annotate <path> <key> <value>` | Add arbitrary metadata to a file |
 
+### Indexing (usually automatic)
+
+| Command | Purpose |
+|---------|---------|
+| `reindex [--embed]` | Force full reindex of the current tree |
+| `embed` | Generate/refresh semantic embeddings for already-indexed content |
+
 ---
 
 ## Search strategy guide
 
 | Goal | Best command |
 |------|-------------|
-| Find files containing an exact phrase or identifier | `search` |
+| Find files containing specific keywords or tokens | `search` |
 | Find files about a concept (natural language) | `semantic` |
 | Find more files like a specific file | `similar` |
 | Filter by path pattern, date, size, MIME type | `query` (SQL) |
 | Find files by EXIF or extracted document metadata | `find` |
+
+---
+
+## Query schema
+
+The `query` command accepts SQL against these tables:
+
+**files** — one row per indexed file
+| Column | Type | Description |
+|--------|------|-------------|
+| path | TEXT (PK) | Absolute file path |
+| mtime | REAL | Last modified timestamp (Unix epoch) |
+| size | INTEGER | File size in bytes |
+| mime | TEXT | MIME type |
+| checksum | TEXT | BLAKE2b content hash |
+| indexed_at | REAL | When this file was last indexed |
+
+**content** — FTS5 virtual table for full-text search
+| Column | Description |
+|--------|-------------|
+| path | File path (unindexed, for joining) |
+| text | Extracted text content |
+
+Use `text MATCH 'term'` for FTS5 queries, `snippet(content, 1, '[', ']', '...', 20)` for
+highlighted excerpts.
+
+**metadata** — key-value pairs extracted from files or added by users
+| Column | Description |
+|--------|-------------|
+| path | File path |
+| key | Metadata key (e.g. `Author`, `camera_model`) |
+| value | Metadata value |
+| source | Origin: `exif`, `extracted`, `user` |
+
+**tags** — labels attached to files
+| Column | Description |
+|--------|-------------|
+| path | File path |
+| tag | Tag string |
+| source | Origin (default: `user`) |
 
 ---
 
@@ -85,13 +118,13 @@ All commands return newline-delimited JSON. Every result includes `path`.
 
 ```jsonc
 // search — includes snippet with context
-{"path": "/home/.../notes/ml.md", "snippet": "...the [gradient descent] optimizer..."}
+{"path": "notes/ml.md", "snippet": "...the [gradient descent] optimizer..."}
 
 // semantic / similar — includes similarity score [0.0–1.0]
-{"path": "/home/.../papers/attention.pdf", "score": 0.8821}
+{"path": "papers/attention.pdf", "score": 0.8821}
 
 // query — returns selected columns
-{"path": "/home/.../README.md", "mime": "text/markdown", "size": 4096}
+{"path": "README.md", "mime": "text/markdown", "size": 4096}
 
 // info — full detail for one file
 // (pretty-printed JSON with "file", "metadata", "tags" keys)
@@ -102,62 +135,28 @@ All commands return newline-delimited JSON. Every result includes `path`.
 ## Examples
 
 ```bash
-FADOS="uv run /home/dennis/src/fados/fados.py"
-
 # Keyword search
-$FADOS search "gradient descent fine-tuning"
+uv run scripts/fados.py search "gradient descent fine-tuning"
 
 # Semantic / conceptual search
-$FADOS semantic "techniques for reducing model hallucination" -n 10
+uv run scripts/fados.py semantic "techniques for reducing model hallucination" -n 10
 
 # Find files similar to a reference file
-$FADOS similar /home/dennis/notes/transformers.md -n 5
+uv run scripts/fados.py similar papers/attention.pdf -n 5
 
-# Recent markdown files containing "LoRA" (SQL)
-$FADOS query "SELECT f.path, snippet(c.content,1,'>>','<<','...',20) AS ctx
-  FROM files f JOIN content c ON c.path=f.path
-  WHERE f.mime='text/markdown'
+# Markdown files modified in the last 30 days mentioning LoRA
+uv run scripts/fados.py query "SELECT f.path FROM files f
+  JOIN content c ON c.path = f.path
+  WHERE f.mime = 'text/markdown'
     AND f.mtime > strftime('%s','now','-30 days')
     AND c.text MATCH 'LoRA'"
 
-# All PDFs in a subtree
-$FADOS query "SELECT path FROM files WHERE path LIKE '/home/dennis/papers/%' AND mime='application/pdf'"
-
 # Find by EXIF/extracted metadata
-$FADOS find Author "Vaswani"
-$FADOS find camera_model "Sony"
+uv run scripts/fados.py find Author "Vaswani"
 
 # Tag and annotate files
-$FADOS tag /home/dennis/papers/attention.pdf seminal
-$FADOS annotate /home/dennis/papers/attention.pdf topic "self-attention transformers"
-
-# Inspect everything FADOS knows about a file
-$FADOS info /home/dennis/papers/attention.pdf
-```
-
----
-
-## Useful SQL patterns
-
-```sql
--- Files modified in the last week
-SELECT path, mime FROM files WHERE mtime > strftime('%s','now','-7 days') ORDER BY mtime DESC
-
--- All unique MIME types in a subtree
-SELECT DISTINCT mime FROM files WHERE path LIKE '/home/dennis/projects/%'
-
--- Files that have a specific tag
-SELECT f.path FROM files f JOIN tags t ON t.path=f.path WHERE t.tag='needs-review'
-
--- Files with user annotations
-SELECT f.path, m.key, m.value FROM files f
-  JOIN metadata m ON m.path=f.path WHERE m.source='user'
-
--- Cross: recent code files mentioning a function name
-SELECT f.path FROM files f JOIN content c ON c.path=f.path
-  WHERE f.mime LIKE 'text/%'
-    AND f.mtime > strftime('%s','now','-14 days')
-    AND c.text MATCH 'my_function_name'
+uv run scripts/fados.py tag papers/attention.pdf seminal
+uv run scripts/fados.py annotate papers/attention.pdf topic "self-attention transformers"
 ```
 
 ---
@@ -165,6 +164,6 @@ SELECT f.path FROM files f JOIN content c ON c.path=f.path
 ## Notes
 
 - Source files are **never modified**
-- `semantic` and `similar` load all embedding vectors into RAM; fine for tens of thousands of files
-- Run `reindex` after large bulk changes; `watch` handles incremental updates
-- `embed` is idempotent — safe to re-run after adding new files to an indexed tree
+- `semantic` and `similar` require embeddings — use `--embed` on first index or run `embed` separately
+- `reindex` forces a full rebuild; normal indexing is incremental
+- `embed` is idempotent — safe to re-run after adding new files

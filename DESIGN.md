@@ -86,9 +86,10 @@ CREATE TABLE tags (
 
 ## Query Language
 
-A SQL-like syntax that compiles to:
+A SQL-compatible query interface over the index tables, plus integration with external tools:
 - SQLite queries (content, metadata, tags)
-- `find` / `rg` invocations (predicate pushdown when possible)
+- `rg` (ripgrep) for exact phrase/literal matching and fast single-pass content search
+- `find` for path-based predicate pushdown
 
 ### Examples
 
@@ -137,9 +138,13 @@ based on result set size and index freshness.
 ## Indexing Pipeline
 
 ### Triggers
-- Manual: `fados index /path`
-- Incremental: `inotifywait` watches the tree, queues changed paths
-- Scheduled: cron-based full scan to catch missed events
+- **Automatic**: on first run in a directory, FADOS indexes the CWD. If the tree is large
+  (many thousands of files/directories), it prints a warning explaining why indexing will be
+  slow and exits with instructions on how to force it.
+- Manual: `fados reindex` forces a full rebuild of the CWD.
+- Incremental: `inotifywait` watches the tree, queues changed paths (user-managed, not
+  agent-facing).
+- Scheduled: cron-based full scan to catch missed events.
 
 ### Per-file pipeline
 
