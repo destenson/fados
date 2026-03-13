@@ -14,6 +14,10 @@ Commands:
   semantic <query> [-n N]   semantic/conceptual search using embeddings (default n=20)
   similar <path> [-n N]     find files with similar content (default n=10)
   find <key> <value>        search metadata
+  definition <term> [-n N]  find where a term is defined (class, function, const, etc.)
+  implementation <term>     find usage of a term in code (excludes tests and docs)
+  documentation <term>      find references in docs (markdown, rst, etc.)
+  tests <term>              find references in test files
   tag <path> <tag>          add a user tag
   annotate <path> <k> <v>   add user metadata
   info <path>               show all indexed info for a file
@@ -383,6 +387,84 @@ def similar(path: str, fados_dir: Path, n: int = 10) -> list:
     scores.sort(reverse=True)
     return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
 
+# --- Intent-based search (ripgrep) ---
+
+TEST_GLOBS = [
+    "test_*", "*_test.*", "*_spec.*", "*Test.*", "*Tests.*",
+    "tests/**", "spec/**", "test/**",
+]
+
+DOC_GLOBS = [
+    "*.md", "*.rst", "*.txt", "*.adoc",
+    "README*", "CHANGELOG*", "LICENSE*",
+    "docs/**", "doc/**",
+]
+
+def _rg(pattern: str, root: Path, *,
+        glob_include: list[str] | None = None,
+        glob_exclude: list[str] | None = None,
+        max_results: int = 50) -> list[dict]:
+    """Run ripgrep and return structured results as [{path, line, match}]."""
+    cmd = ["rg", "-n", "--no-heading", "-e", pattern]
+    for d in IGNORE_DIRS:
+        cmd.extend(["--glob", f"!{d}/"])
+    if glob_include:
+        for g in glob_include:
+            cmd.extend(["--glob", g])
+    if glob_exclude:
+        for g in glob_exclude:
+            cmd.extend(["--glob", f"!{g}"])
+    cmd.append(str(root))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        results = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split(':', 2)
+            if len(parts) >= 3:
+                results.append({
+                    "path": parts[0],
+                    "line": int(parts[1]),
+                    "match": parts[2].strip()
+                })
+                if len(results) >= max_results:
+                    break
+        return results
+    except Exception:
+        return []
+
+
+def search_definition(term: str, root: Path, n: int = 20) -> list[dict]:
+    """Find where a term is defined (classes, functions, constants, types)."""
+    escaped = re.escape(term)
+    pattern = (
+        rf'(?:def|class|fn|func|function|struct|enum|trait|impl|interface|type|module)'
+        rf'\s+{escaped}\b'
+        rf'|(?:const|let|var|static|#define)\s+(?:\w+\s+)*\b{escaped}\b'
+    )
+    return _rg(pattern, root, max_results=n)
+
+
+def search_tests(term: str, root: Path, n: int = 20) -> list[dict]:
+    """Find test code referencing a term."""
+    escaped = re.escape(term)
+    return _rg(rf'\b{escaped}\b', root, glob_include=TEST_GLOBS, max_results=n)
+
+
+def search_documentation(term: str, root: Path, n: int = 20) -> list[dict]:
+    """Find documentation referencing a term."""
+    escaped = re.escape(term)
+    return _rg(rf'\b{escaped}\b', root, glob_include=DOC_GLOBS, max_results=n)
+
+
+def search_implementation(term: str, root: Path, n: int = 20) -> list[dict]:
+    """Find implementation code referencing a term (excludes tests and docs)."""
+    escaped = re.escape(term)
+    return _rg(rf'\b{escaped}\b', root,
+               glob_exclude=TEST_GLOBS + DOC_GLOBS, max_results=n)
+
+
 # --- Mutations ---
 
 def tag(path: str, tag_name: str, fados_dir: Path):
@@ -461,6 +543,10 @@ def main():
     p = sub.add_parser("annotate"); p.add_argument("path"); p.add_argument("key"); p.add_argument("value")
     p = sub.add_parser("info");     p.add_argument("path")
     p = sub.add_parser("watch");    p.add_argument("path")
+    p = sub.add_parser("definition"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("implementation"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("documentation"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("tests"); p.add_argument("term"); p.add_argument("-n", type=int, default=20)
 
     args = ap.parse_args()
 
@@ -476,8 +562,11 @@ def main():
     fados_dir = resolve_fados_dir(user=args.user, target=target,
                                   path_override=path_override)
 
-    # Auto-index on first run (skip for reindex, which always indexes)
-    if args.cmd != "reindex" and _needs_auto_index(fados_dir):
+    # Intent-based search uses ripgrep directly, no index needed
+    RG_COMMANDS = {"definition", "implementation", "documentation", "tests"}
+
+    # Auto-index on first run (skip for reindex and rg-based commands)
+    if args.cmd not in ("reindex", *RG_COMMANDS) and _needs_auto_index(fados_dir):
         _auto_index(fados_dir)
 
     match args.cmd:
@@ -505,6 +594,15 @@ def main():
             print(json.dumps(info(args.path, fados_dir), indent=2, default=str))
         case "watch":
             watch(Path(args.path), fados_dir)
+        case "definition" | "implementation" | "documentation" | "tests":
+            root = fados_dir.parent
+            func = {
+                "definition": search_definition,
+                "implementation": search_implementation,
+                "documentation": search_documentation,
+                "tests": search_tests,
+            }[args.cmd]
+            print_results(func(args.term, root, args.n))
         case _:
             ap.print_help()
 

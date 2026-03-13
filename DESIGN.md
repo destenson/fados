@@ -260,18 +260,14 @@ suggests tagging rules and display hints.
 - Embedding extraction on indexed content
 - `fados_similar` via sqlite-vec
 
-### Phase 4 — Intent-based search
-- `search definition <term>` — find where something is defined (classes, functions, constants)
-- `search implementation <term>` — find where something is used/implemented
-- `search documentation <term>` — search within documentation content (docstrings, comments,
-  markdown, READMEs), not by file location
-- `search tests <term>` — search within test content (assertions, test functions, fixtures)
+### Phase 4 — Intent-based search ✓
+- `definition <term>` — find where something is defined (classes, functions, constants, types)
+- `implementation <term>` — find where something is used/implemented (excludes tests and docs)
+- `documentation <term>` — search within documentation files (markdown, rst, etc.)
+- `tests <term>` — search within test files
 
-Strategy: leverage ripgrep's `--type` filters to restrict to source code file types, combined
-with language-aware regex patterns (e.g. `def <term>`, `class <term>`, `fn <term>`,
-`func <term>`) for definitions. For documentation vs tests vs implementation, classify by
-content patterns rather than file paths — docstrings and comment blocks for documentation,
-test assertions and test function signatures for tests, everything else for implementation.
+Uses ripgrep directly (no index required) with language-aware regex patterns for definitions
+and glob-based file classification for tests vs docs vs implementation.
 
 ### Phase 5 — Agent protocol integration (future, low priority)
 - MCP server wrapping the CLI

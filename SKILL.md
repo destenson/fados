@@ -10,8 +10,11 @@ Use `--user` to use `~/.fados/` instead.
 
 ## When to invoke
 
+- Finding where a function, class, type, or constant is defined
+- Finding implementation code that uses a term (excluding tests and docs)
+- Finding documentation that references a term
+- Finding test code that references a term
 - Searching a local document or knowledge base by content, topic, or meaning
-- Finding code files that discuss or implement a concept
 - Discovering files related to a topic when you don't know the exact filename/path
 - Annotating files with tags or metadata for later retrieval
 - Querying files by structured attributes (date, size, MIME type, EXIF metadata)
@@ -34,7 +37,18 @@ The script path is relative to this SKILL.md file.
 
 ## Commands
 
-### Searching
+### Intent-based search (no index required — uses ripgrep)
+
+| Command | Purpose |
+|---------|---------|
+| `definition <term> [-n N]` | Find where a term is defined (class, function, type, const, etc.) |
+| `implementation <term> [-n N]` | Find usage in code (excludes tests and docs) |
+| `documentation <term> [-n N]` | Find references in docs (markdown, rst, etc.) |
+| `tests <term> [-n N]` | Find references in test files |
+
+These are the fastest commands — they need no index, just `rg` installed.
+
+### Index-based search
 
 | Command | Purpose |
 |---------|---------|
@@ -65,6 +79,10 @@ The script path is relative to this SKILL.md file.
 
 | Goal | Best command |
 |------|-------------|
+| Find where something is defined (class, function, type) | `definition` |
+| Find code that uses/calls something (not tests or docs) | `implementation` |
+| Find documentation about something | `documentation` |
+| Find test code for something | `tests` |
 | Find files containing specific keywords or tokens | `search` |
 | Find files about a concept (natural language) | `semantic` |
 | Find more files like a specific file | `similar` |
@@ -118,6 +136,9 @@ highlighted excerpts.
 All commands return newline-delimited JSON. Every result includes `path`.
 
 ```jsonc
+// definition / implementation / documentation / tests — includes line number and matched text
+{"path": "src/model.py", "line": 42, "match": "class ModelConfig:"}
+
 // search — includes snippet with context
 {"path": "notes/ml.md", "snippet": "...the [gradient descent] optimizer..."}
 
@@ -136,6 +157,18 @@ All commands return newline-delimited JSON. Every result includes `path`.
 ## Examples
 
 ```bash
+# Find where a class/function/type is defined
+uv run scripts/fados.py definition ModelConfig
+
+# Find implementation code using a term (excludes tests and docs)
+uv run scripts/fados.py implementation ModelConfig -n 30
+
+# Find documentation about a term
+uv run scripts/fados.py documentation ModelConfig
+
+# Find test code referencing a term
+uv run scripts/fados.py tests ModelConfig
+
 # Keyword search
 uv run scripts/fados.py search "gradient descent fine-tuning"
 

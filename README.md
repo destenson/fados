@@ -19,7 +19,9 @@ index is always rebuildable from the source tree.
 **Python dependencies** (managed automatically by `uv`):
 
 - `python-magic`
-- `rich`
+
+**Optional** (for semantic search):
+
 - `sentence-transformers`
 - `numpy`
 
@@ -27,10 +29,11 @@ index is always rebuildable from the source tree.
 
 | Tool            | Used for                        |
 | --------------- | ------------------------------- |
-| `exiftool`      | EXIF / file metadata extraction |
-| `pdftotext`     | PDF text extraction             |
-| `pandoc`        | Word/ODF document extraction    |
-| `inotify-tools` | `watch` command (Linux only)    |
+| `exiftool`      | EXIF / file metadata extraction          |
+| `pdftotext`     | PDF text extraction                      |
+| `pandoc`        | Word/ODF document extraction             |
+| `ripgrep` (`rg`)| Intent-based search (definition, etc.)   |
+| `inotify-tools` | `watch` command (Linux only)             |
 
 ## Installation
 
@@ -50,18 +53,28 @@ Use `--user` to store the index at `~/.fados/index.db` instead.
 ```
 Global flags:
   --user                 Use ~/.fados/ instead of local .fados/ in the indexed tree.
+  --dir <path>           Target directory to search (uses <dir>/.fados/ for the index).
 
-reindex <path> [--embed]  Force a full rebuild of the index. Indexing is automatic on first run.
-embed <path>              Generate/refresh semantic embeddings for already-indexed content.
-query <sql>               Raw SQL against the index database.
-search <terms>            Full-text keyword search (FTS5).
-semantic <query> [-n N]   Semantic/conceptual search using embeddings (default: top 20).
-similar <path> [-n N]     Find files with similar content (default: top 10).
-find <key> <value>        Search metadata by key/value.
-tag <path> <tag>          Add a user tag to a file.
-annotate <path> <k> <v>   Add arbitrary user metadata to a file.
-info <path>               Show all indexed data for a file.
-watch <path>              Watch for changes and reindex incrementally (requires inotify-tools).
+Index-based commands:
+  reindex <path> [--embed]  Force a full rebuild of the index. Indexing is automatic on first run.
+  embed <path>              Generate/refresh semantic embeddings for already-indexed content.
+  query <sql>               Raw SQL against the index database.
+  search <terms>            Full-text keyword search (FTS5).
+  semantic <query> [-n N]   Semantic/conceptual search using embeddings (default: top 20).
+  similar <path> [-n N]     Find files with similar content (default: top 10).
+  find <key> <value>        Search metadata by key/value.
+
+Intent-based search (uses ripgrep, no index required):
+  definition <term> [-n N]      Find where a term is defined (class, function, type, etc.).
+  implementation <term> [-n N]  Find usage in code (excludes tests and docs).
+  documentation <term> [-n N]   Find references in docs (markdown, rst, etc.).
+  tests <term> [-n N]           Find references in test files.
+
+File info and annotation:
+  tag <path> <tag>          Add a user tag to a file.
+  annotate <path> <k> <v>   Add arbitrary user metadata to a file.
+  info <path>               Show all indexed data for a file.
+  watch <path>              Watch for changes and reindex incrementally (requires inotify-tools).
 ```
 
 ## Examples
@@ -86,6 +99,18 @@ uv run scripts/fados.py find camera_model Sony
 uv run scripts/fados.py tag /path/to/file.md needs-review
 uv run scripts/fados.py annotate /path/to/file.md project alpha
 
+# Find where a function/class/type is defined
+uv run scripts/fados.py definition MyClass
+
+# Find usage of a term in implementation code (not tests or docs)
+uv run scripts/fados.py implementation MyClass -n 30
+
+# Find references in documentation
+uv run scripts/fados.py documentation MyClass
+
+# Find references in test code
+uv run scripts/fados.py tests MyClass
+
 # Inspect everything known about a file
 uv run scripts/fados.py info /path/to/file.md
 
@@ -104,11 +129,11 @@ with `--user`) and contains:
 - `tags` — user and inferred tags
 - `embeddings` — binary sentence-transformer vectors for semantic search
 
-The index is a cache. Delete it and run `index` again to start fresh.
+The index is a cache. Delete it and run `reindex` again to start fresh.
 
 ## Index Location
 
-By default, `fados index <path>` creates `.fados/index.db` inside the indexed
+By default, `fados reindex <path>` creates `.fados/index.db` inside the indexed
 directory. Query commands (`search`, `semantic`, etc.) discover the index by
 walking up from CWD, git-style — stopping before `~/`.
 
