@@ -247,7 +247,7 @@ suggests tagging rules and display hints.
 ## Implementation Phases
 
 ### Phase 1 — Core index
-- `fados index <path>` builds SQLite index
+- `fados reindex <path>` builds SQLite index
 - Basic SQL query interface
 - File watcher for incremental updates
 
