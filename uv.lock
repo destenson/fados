@@ -88,7 +88,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "python-magic" },
-    { name = "rich" },
 ]
 
 [package.optional-dependencies]
@@ -101,7 +100,6 @@ semantic = [
 requires-dist = [
     { name = "numpy", marker = "extra == 'semantic'" },
     { name = "python-magic" },
-    { name = "rich" },
     { name = "sentence-transformers", marker = "extra == 'semantic'" },
 ]
 provides-extras = ["semantic"]
