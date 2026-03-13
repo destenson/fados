@@ -203,23 +203,25 @@ Both supported; shadow tree is default.
 
 ## Agent Interface
 
-The CLI is the primary interface. Agents invoke FADOS via `uv run scripts/fados.py <command>`.
+FADOS is designed to be used as a **Claude Code skill**. A `SKILL.md` file describes when,
+why, and how to invoke the CLI — agents read the skill file and shell out to the script
+directly via `uv run scripts/fados.py <command>`.
+
 All commands return newline-delimited JSON with `path` in every result record, so agents can
 reference files directly.
 
 ```
-fados_query(sql)          → [{path, mime, mtime, snippet, ...}]
-fados_read(path)          → {content, metadata, tags}
-fados_tag(path, tag)      → ok
-fados_annotate(path, key, value) → ok
-fados_similar(path, n)    → [{path, score}]   ← embedding-based, optional
+fados query <sql>               → [{path, mime, mtime, snippet, ...}]
+fados info <path>               → {file, metadata, tags}
+fados tag <path> <tag>          → (silent on success)
+fados annotate <path> <k> <v>   → (silent on success)
+fados search <terms>            → [{path, snippet}]
+fados semantic <query> [-n N]   → [{path, score}]
+fados similar <path> [-n N]     → [{path, score}]
 ```
 
-`fados_similar` is an optional layer: embed extracted content, store in a vector sidecar
-(sqlite-vec or hnswlib), enable semantic search alongside keyword search.
-
-> **Future**: An MCP server or HTTP API could wrap the CLI for tighter agent integration,
-> but this is low priority — the CLI works well enough for current use cases.
+> **Future (low priority)**: An MCP server or HTTP API could wrap the CLI for networked or
+> tighter protocol-level integration, but the skill + CLI approach covers current use cases.
 
 ---
 
