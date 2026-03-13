@@ -34,8 +34,40 @@ import argparse
 
 # --- Config ---
 
-FADOS_DIR = Path.home() / ".fados"
-DB_PATH = FADOS_DIR / "index.db"
+USER_FADOS_DIR = Path.home() / ".fados"
+
+def _find_local_fados_dir() -> Optional[Path]:
+    """Walk up from CWD looking for .fados/, git-style. Stops before ~/."""
+    home = Path.home()
+    cur = Path.cwd().resolve()
+    while True:
+        candidate = cur / ".fados"
+        if candidate.is_dir():
+            return candidate
+        parent = cur.parent
+        if parent == cur or cur == home:
+            break
+        cur = parent
+    return None
+
+def resolve_fados_dir(*, user: bool = False, target: Optional[Path] = None) -> Path:
+    """Determine where .fados/ lives.
+
+    --user flag:  always ~/.fados/
+    index/reindex/embed/watch:  <target>/.fados/
+    other commands:  walk up from CWD to find .fados/
+    """
+    if user:
+        return USER_FADOS_DIR
+    if target is not None:
+        return target.resolve() / ".fados"
+    found = _find_local_fados_dir()
+    if found:
+        return found
+    print("error: no .fados/ index found (walk from CWD to /). "
+          "Run 'fados index <path>' first, or use --user for ~/.fados/.",
+          file=sys.stderr)
+    sys.exit(1)
 
 # --- DB setup ---
 
@@ -70,9 +102,10 @@ CREATE INDEX IF NOT EXISTS idx_meta_key ON metadata(key, value);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 """
 
-def db_connect() -> sqlite3.Connection:
-    FADOS_DIR.mkdir(exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+def db_connect(fados_dir: Path) -> sqlite3.Connection:
+    fados_dir.mkdir(parents=True, exist_ok=True)
+    db_path = fados_dir / "index.db"
+    con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     con.execute("PRAGMA journal_mode=WAL")
@@ -179,8 +212,8 @@ def index_file(con: sqlite3.Connection, path: Path, force: bool = False):
             VALUES (?,?,?,'exif')
         """, (str(path), k, v))
 
-def index_tree(root: Path, force: bool = False):
-    con = db_connect()
+def index_tree(root: Path, fados_dir: Path, force: bool = False):
+    con = db_connect(fados_dir)
     IGNORE = {".git", ".fados", "__pycache__", "node_modules", ".venv"}
     count = 0
     errors = 0
@@ -204,26 +237,28 @@ def index_tree(root: Path, force: bool = False):
 
 # --- Query ---
 
-def query(sql: str, params=()):
-    con = db_connect()
+def query(sql: str, fados_dir: Path, params=()):
+    con = db_connect(fados_dir)
     try:
         rows = con.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
     finally:
         con.close()
 
-def search(terms: str):
+def search(terms: str, fados_dir: Path):
     return query(
         "SELECT path, snippet(content, 1, '[', ']', '...', 20) AS snippet "
         "FROM content WHERE text MATCH ? ORDER BY rank",
+        fados_dir,
         (terms,)
     )
 
-def find_meta(key: str, value: str):
+def find_meta(key: str, value: str, fados_dir: Path):
     return query(
         "SELECT f.path, f.mime, m.value FROM files f "
         "JOIN metadata m ON m.path = f.path "
         "WHERE m.key = ? AND m.value LIKE ?",
+        fados_dir,
         (key, f"%{value}%")
     )
 
@@ -250,10 +285,10 @@ def _store_embedding(con: sqlite3.Connection, path: Path, text: str):
         (str(path), vec_bytes)
     )
 
-def embed_tree(root: Path):
+def embed_tree(root: Path, fados_dir: Path):
     """Generate / refresh embeddings for all indexed text content under root."""
     import numpy as np
-    con = db_connect()
+    con = db_connect(fados_dir)
     rows = con.execute(
         "SELECT c.path, c.text FROM content c "
         "JOIN files f ON f.path = c.path "
@@ -276,11 +311,11 @@ def embed_tree(root: Path):
     con.close()
     print(f"\nembedded {total - errors} files ({errors} errors)")
 
-def semantic(query_text: str, n: int = 20) -> list:
+def semantic(query_text: str, fados_dir: Path, n: int = 20) -> list:
     """Semantic search using cosine similarity over stored embeddings."""
     import numpy as np
     q_vec = np.frombuffer(_embed(query_text), dtype=np.float32)
-    con = db_connect()
+    con = db_connect(fados_dir)
     rows = con.execute("SELECT path, vector FROM embeddings").fetchall()
     con.close()
     if not rows:
@@ -292,10 +327,10 @@ def semantic(query_text: str, n: int = 20) -> list:
     scores.sort(reverse=True)
     return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
 
-def similar(path: str, n: int = 10) -> list:
+def similar(path: str, fados_dir: Path, n: int = 10) -> list:
     """Find files with content similar to the given path."""
     import numpy as np
-    con = db_connect()
+    con = db_connect(fados_dir)
     row = con.execute("SELECT vector FROM embeddings WHERE path=?", (path,)).fetchone()
     if not row:
         con.close()
@@ -314,14 +349,14 @@ def similar(path: str, n: int = 10) -> list:
 
 # --- Mutations ---
 
-def tag(path: str, tag: str):
-    con = db_connect()
-    con.execute("INSERT OR REPLACE INTO tags(path, tag) VALUES (?,?)", (path, tag))
+def tag(path: str, tag_name: str, fados_dir: Path):
+    con = db_connect(fados_dir)
+    con.execute("INSERT OR REPLACE INTO tags(path, tag) VALUES (?,?)", (path, tag_name))
     con.commit()
     con.close()
 
-def annotate(path: str, key: str, value: str):
-    con = db_connect()
+def annotate(path: str, key: str, value: str, fados_dir: Path):
+    con = db_connect(fados_dir)
     con.execute("""
         INSERT OR REPLACE INTO metadata(path, key, value, source)
         VALUES (?,?,?,'user')
@@ -329,8 +364,8 @@ def annotate(path: str, key: str, value: str):
     con.commit()
     con.close()
 
-def info(path: str):
-    con = db_connect()
+def info(path: str, fados_dir: Path):
+    con = db_connect(fados_dir)
     file_row = con.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
     meta = con.execute("SELECT key, value, source FROM metadata WHERE path=?", (path,)).fetchall()
     tags_ = con.execute("SELECT tag, source FROM tags WHERE path=?", (path,)).fetchall()
@@ -343,7 +378,7 @@ def info(path: str):
 
 # --- Watch (inotifywait) ---
 
-def watch(root: Path):
+def watch(root: Path, fados_dir: Path):
     """Incrementally reindex on filesystem changes. Requires inotify-tools."""
     print(f"watching {root} ...")
     proc = subprocess.Popen(
@@ -351,7 +386,7 @@ def watch(root: Path):
          "--format", "%w%f", str(root)],
         stdout=subprocess.PIPE, text=True
     )
-    con = db_connect()
+    con = db_connect(fados_dir)
     for line in proc.stdout:
         path = Path(line.strip())
         if path.is_file():
@@ -373,9 +408,10 @@ def print_results(rows: list):
 
 def main():
     ap = argparse.ArgumentParser(prog="fados", description="Filesystem As Database Overlay System")
+    ap.add_argument("--user", action="store_true",
+                    help="use ~/.fados/ instead of local .fados/ in the indexed tree")
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("index");    p.add_argument("path"); p.add_argument("--embed", action="store_true", help="also generate semantic embeddings")
     p = sub.add_parser("reindex");  p.add_argument("path"); p.add_argument("--embed", action="store_true")
     p = sub.add_parser("embed");    p.add_argument("path", help="root path whose indexed content to embed")
     p = sub.add_parser("query");    p.add_argument("sql")
@@ -390,31 +426,41 @@ def main():
 
     args = ap.parse_args()
 
+    if not args.cmd:
+        ap.print_help()
+        return
+
+    # Commands that take a target path create .fados/ inside that path.
+    # Other commands discover .fados/ by walking up from CWD.
+    has_target = args.cmd in ("reindex", "embed", "watch")
+    target = Path(args.path) if has_target else None
+    fados_dir = resolve_fados_dir(user=args.user, target=target)
+
     match args.cmd:
         case "reindex":
-            index_tree(Path(args.path), force=True)
+            index_tree(Path(args.path), fados_dir, force=True)
             if args.embed:
-                embed_tree(Path(args.path))
+                embed_tree(Path(args.path), fados_dir)
         case "embed":
-            embed_tree(Path(args.path))
+            embed_tree(Path(args.path), fados_dir)
         case "query":
-            print_results(query(args.sql))
+            print_results(query(args.sql, fados_dir))
         case "search":
-            print_results(search(" ".join(args.terms)))
+            print_results(search(" ".join(args.terms), fados_dir))
         case "semantic":
-            print_results(semantic(" ".join(args.query), args.n))
+            print_results(semantic(" ".join(args.query), fados_dir, args.n))
         case "similar":
-            print_results(similar(args.path, args.n))
+            print_results(similar(args.path, fados_dir, args.n))
         case "find":
-            print_results(find_meta(args.key, args.value))
+            print_results(find_meta(args.key, args.value, fados_dir))
         case "tag":
-            tag(args.path, args.tag)
+            tag(args.path, args.tag, fados_dir)
         case "annotate":
-            annotate(args.path, args.key, args.value)
+            annotate(args.path, args.key, args.value, fados_dir)
         case "info":
-            print(json.dumps(info(args.path), indent=2, default=str))
+            print(json.dumps(info(args.path, fados_dir), indent=2, default=str))
         case "watch":
-            watch(Path(args.path))
+            watch(Path(args.path), fados_dir)
         case _:
             ap.print_help()
 

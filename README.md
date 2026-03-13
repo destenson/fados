@@ -42,13 +42,16 @@ uv run scripts/fados.py <command> [args]
 ```
 
 `uv` will install Python dependencies automatically on first run. The index is
-stored at `~/.fados/index.db`.
+stored at `<indexed-path>/.fados/index.db` by default (colocated with the data).
+Use `--user` to store the index at `~/.fados/index.db` instead.
 
 ## Commands
 
 ```
-index <path> [--embed]    Index a directory tree. --embed also generates vector embeddings.
-reindex <path> [--embed]  Force a full rebuild of the index.
+Global flags:
+  --user                 Use ~/.fados/ instead of local .fados/ in the indexed tree.
+
+reindex <path> [--embed]  Force a full rebuild of the index. Indexing is automatic on first run.
 embed <path>              Generate/refresh semantic embeddings for already-indexed content.
 query <sql>               Raw SQL against the index database.
 search <terms>            Full-text keyword search (FTS5).
@@ -64,13 +67,7 @@ watch <path>              Watch for changes and reindex incrementally (requires 
 ## Examples
 
 ```sh
-# Index the current directory
-uv run scripts/fados.py index .
-
-# Index and also build semantic embeddings in one pass
-uv run scripts/fados.py index . --embed
-
-# Full-text search
+# Full-text search (auto-indexes CWD on first run)
 uv run scripts/fados.py search gradient descent
 
 # Semantic / conceptual search
@@ -98,7 +95,8 @@ uv run scripts/fados.py watch .
 
 ## Index Schema
 
-The SQLite index lives at `~/.fados/index.db` and contains:
+The SQLite index lives at `<indexed-path>/.fados/index.db` (or `~/.fados/index.db`
+with `--user`) and contains:
 
 - `files` — path, mtime, size, MIME type, checksum
 - `content` — FTS5 full-text index of extracted file content
@@ -107,6 +105,14 @@ The SQLite index lives at `~/.fados/index.db` and contains:
 - `embeddings` — binary sentence-transformer vectors for semantic search
 
 The index is a cache. Delete it and run `index` again to start fresh.
+
+## Index Location
+
+By default, `fados index <path>` creates `.fados/index.db` inside the indexed
+directory. Query commands (`search`, `semantic`, etc.) discover the index by
+walking up from CWD, git-style — stopping before `~/`.
+
+Use `--user` on any command to use `~/.fados/` instead.
 
 ## Notes
 

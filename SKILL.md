@@ -4,8 +4,9 @@ FADOS indexes the current working directory into a disposable SQLite database, e
 full-text, metadata, and semantic (vector) search over files — without moving or modifying them.
 The index is always rebuildable from the source tree.
 
-Indexing happens automatically on first run. If the tree is large enough that indexing would
-be slow, the script prints a warning and exits with instructions on how to force it.
+Indexing happens automatically on first run. The index is stored at `<path>/.fados/index.db`,
+colocated with the data. Query commands discover the index by walking up from CWD (git-style).
+Use `--user` to use `~/.fados/` instead.
 
 ## When to invoke
 
