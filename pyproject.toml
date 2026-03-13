@@ -5,7 +5,6 @@ description = "Filesystem As Database Overlay System"
 requires-python = ">=3.11"
 dependencies = [
     "python-magic",
-    "rich",
 ]
 
 [project.optional-dependencies]
