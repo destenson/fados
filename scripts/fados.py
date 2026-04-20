@@ -36,7 +36,7 @@ import subprocess
 import json
 import time
 import mimetypes
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -606,38 +606,78 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False,
         print("nothing to index", file=sys.stderr)
         return
 
-    max_workers = min(os.cpu_count() or 4, 16)
-    print(f"indexing {len(todo)} files with {max_workers} workers...",
-          file=sys.stderr)
+    cpu = os.cpu_count() or 4
+    max_workers = min(cpu, 16)
+    # Each exiftool is single-threaded; cap the thread pool so we don't
+    # over-fork on small boxes. Cap at 8 because past that you hit fork
+    # contention faster than you gain throughput.
+    exif_workers = min(cpu, 8)
+    print(f"indexing {len(todo)} files with {max_workers} extract workers "
+          f"+ {exif_workers} exif workers...", file=sys.stderr)
     t0 = time.time()
     count = 0
     skipped = 0
     errors = 0
 
     pending: list[dict] = []
-    batches = 0
+    # Exif futures run concurrently with extraction; each future holds
+    # the batch of dicts it was submitted with so we can merge results
+    # back without a separate lookup.
+    exif_futures: dict = {}
 
-    def flush_batch():
-        """Drain `pending`: one batched exiftool call over the files
-        that want it, then write everything to the DB. Files with no
-        chunks AND no exif are skipped entirely — they'd add a useless
-        row with no searchable content."""
+    def write_batch(batch: list[dict], exif_map: dict[str, dict]):
         nonlocal count, skipped
-        if not pending:
-            return
-        want = [d["path"] for d in pending if _wants_exif(d["mime"])]
-        exif_map = batch_exiftool(want)
-        for d in pending:
+        for d in batch:
             d["exif"] = exif_map.get(d["path"], {})
             if not d["chunks"] and not d["exif"]:
                 skipped += 1
                 continue
             _write_indexed(con, d)
             count += 1
-        pending.clear()
 
-    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+    def drain_exif(block: bool = False):
+        """Move any exif futures whose subprocess has returned onto the
+        writer. With block=True wait for at least one to complete —
+        used when we need to bound memory growth of pending futures
+        (the pool would queue more work behind them) or at shutdown."""
+        if not exif_futures:
+            return
+        done = [f for f in exif_futures if f.done()]
+        if block and not done:
+            done = [next(iter(as_completed(list(exif_futures))))]
+        for f in done:
+            batch = exif_futures.pop(f)
+            try:
+                write_batch(batch, f.result())
+            except Exception as e:
+                # exif subprocess crashed — write without metadata rather
+                # than losing the chunks we already extracted.
+                print(f"  error: exif batch failed: {e}", file=sys.stderr)
+                write_batch(batch, {})
+
+    def submit_batch(exif_pool: ThreadPoolExecutor):
+        if not pending:
+            return
+        batch = list(pending)
+        pending.clear()
+        want = [d["path"] for d in batch if _wants_exif(d["mime"])]
+        if not want:
+            # Skip the subprocess entirely for pure-text batches.
+            write_batch(batch, {})
+            return
+        fut = exif_pool.submit(batch_exiftool, want)
+        exif_futures[fut] = batch
+
+    # Cap the number of in-flight exif batches so pending memory doesn't
+    # balloon if extraction outruns exiftool. Twice the worker count gives
+    # each worker a next-batch already queued without starving.
+    max_inflight = exif_workers * 2
+
+    with ProcessPoolExecutor(max_workers=max_workers) as pool, \
+            ThreadPoolExecutor(max_workers=exif_workers,
+                               thread_name_prefix="exif") as exif_pool:
         futures = {pool.submit(_extract_fast, p): p for p in todo}
+        batches = 0
         for fut in as_completed(futures):
             p = futures[fut]
             try:
@@ -647,14 +687,22 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False,
                 print(f"  error: {p}: {e}", file=sys.stderr)
                 continue
             if len(pending) >= EXIF_BATCH:
-                flush_batch()
+                if len(exif_futures) >= max_inflight:
+                    drain_exif(block=True)
+                submit_batch(exif_pool)
                 batches += 1
                 if batches % 20 == 0:
+                    drain_exif()
                     con.commit()
                     elapsed = time.time() - t0
                     print(f"  indexing: {count + skipped}/{len(todo)} "
                           f"({elapsed:.0f}s)...", file=sys.stderr, flush=True)
-    flush_batch()
+            else:
+                drain_exif()
+        # Flush partial last batch, then drain all outstanding exif work.
+        submit_batch(exif_pool)
+        while exif_futures:
+            drain_exif(block=True)
     con.commit()
     con.close()
     elapsed = time.time() - t0
