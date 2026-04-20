@@ -1044,8 +1044,20 @@ def _get_model():
     global _model
     if _model is None:
         _require_semantic_deps()
+        # Silence HF/transformers progress bars and the "BertModel LOAD
+        # REPORT" table that sentence-transformers prints on load.
+        # fados stdout is parsed as NDJSON by callers (shells, LLMs),
+        # so any stray text breaks downstream parsing. Set env vars
+        # before import so they take effect, then redirect stdout to
+        # stderr for the duration of the load as a belt-and-braces
+        # guard against libraries that print directly.
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        import contextlib
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        with contextlib.redirect_stdout(sys.stderr):
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
     return _model
 
 
@@ -1519,6 +1531,25 @@ def reindex(ctx, path, do_embed, include_hidden, include_deps):
                include_hidden=include_hidden, include_deps=include_deps)
     if do_embed:
         embed_tree(c.root, c.fados_dir)
+
+
+@cli.command()
+@click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--hidden", "include_hidden", is_flag=True,
+              help="Keep dot-prefixed files that would otherwise be pruned.")
+@click.option("--deps", "include_deps", is_flag=True,
+              help="Keep dependency/build dirs that would otherwise be pruned.")
+@click.pass_context
+def refresh(ctx, path, include_hidden, include_deps):
+    """Prune ignored/missing files and reindex anything whose mtime advanced.
+
+    Run this after tightening ignore rules or when files have been
+    deleted from disk — plain reindex only adds/updates, never removes.
+    """
+    c = _resolve_ctx(ctx, path)
+    refresh_tree(c.root, c.fados_dir,
+                 include_hidden=include_hidden,
+                 include_deps=include_deps)
 
 
 @cli.command()
