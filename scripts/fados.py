@@ -286,8 +286,14 @@ def extract_chunks(path: Path, mime: str):
     for idx, (_, _, chunk_text) in enumerate(_chunk_bytes_utf8(raw)):
         yield idx, 0, size, chunk_text
 
-def extract_exif(path: Path) -> dict:
-    """Extract EXIF/file metadata via exiftool as flat key:value dict."""
+def extract_exif(path: Path, mime: str) -> dict:
+    """Extract EXIF/file metadata via exiftool as flat key:value dict.
+
+    Skipped for text/* and application/gzip — exiftool has no real
+    metadata to contribute there, and the subprocess cost dominates
+    indexing of text-heavy trees."""
+    if mime.startswith("text/") or mime == "application/gzip":
+        return {}
     try:
         result = subprocess.run(
             ["exiftool", "-json", "-fast", str(path)],
@@ -357,7 +363,7 @@ def index_file(con: sqlite3.Connection, path: Path, force: bool = False):
 
     # EXIF / extracted metadata
     con.execute("DELETE FROM metadata WHERE path=? AND source != 'user'", (str(path),))
-    for k, v in extract_exif(path).items():
+    for k, v in extract_exif(path, mime).items():
         con.execute("""
             INSERT OR REPLACE INTO metadata(path, key, value, source)
             VALUES (?,?,?,'exif')
