@@ -34,9 +34,9 @@ import re
 import sqlite3
 import subprocess
 import json
-import hashlib
 import time
 import mimetypes
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -135,7 +135,6 @@ CREATE TABLE IF NOT EXISTS files (
     mtime       REAL,
     size        INTEGER,
     mime        TEXT,
-    checksum    TEXT,
     indexed_at  REAL
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -188,18 +187,77 @@ def db_connect(fados_dir: Path) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS silently accepts an older, differently
+    # shaped `files` table — so validate column sets against the current
+    # schema and refuse to operate on an incompatible DB. The fix is a
+    # full rebuild, not a migration.
+    _assert_schema_compatible(con, db_path)
+    # WAL + relaxed fsync + bigger cache make bulk indexing much faster;
+    # NORMAL is still crash-safe (losing the tail of an uncommitted txn
+    # is fine — the index is rebuildable from the source tree anyway).
     con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA cache_size=-65536")
     return con
 
+
+EXPECTED_FILES_COLUMNS = {"path", "mtime", "size", "mime", "indexed_at"}
+
+
+def _assert_schema_compatible(con: sqlite3.Connection, db_path: Path):
+    """Compare the `files` table's actual columns to what this version
+    expects. A mismatch means the DB was written by a prior fados whose
+    schema has since changed — bail with a clear remediation."""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(files)").fetchall()}
+    if cols != EXPECTED_FILES_COLUMNS:
+        extra = cols - EXPECTED_FILES_COLUMNS
+        missing = EXPECTED_FILES_COLUMNS - cols
+        diff_parts = []
+        if extra:
+            diff_parts.append(f"unexpected columns: {sorted(extra)}")
+        if missing:
+            diff_parts.append(f"missing columns: {sorted(missing)}")
+        con.close()
+        print(
+            f"error: incompatible fados index at {db_path}\n"
+            f"  {'; '.join(diff_parts)}\n"
+            f"  this index was written by a different version of fados. "
+            f"no migration is provided — delete the .fados directory and "
+            f"reindex:\n"
+            f"    rm -rf {db_path.parent} && fados reindex <path>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
 # --- MIME detection ---
+
+# libmagic reports many structured text formats as the generic "text/plain"
+# because they lack magic bytes. Override by extension so SQL filters like
+# `WHERE mime='text/markdown'` actually match.
+_EXT_MIME_OVERRIDES = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".rst": "text/x-rst",
+    ".adoc": "text/asciidoc",
+    ".org": "text/x-org",
+    ".toml": "application/toml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
 
 def detect_mime(path: Path) -> str:
     try:
         import magic
-        return magic.from_file(str(path), mime=True)
+        mime = magic.from_file(str(path), mime=True)
     except Exception:
-        mime, _ = mimetypes.guess_type(str(path))
-        return mime or "application/octet-stream"
+        guessed, _ = mimetypes.guess_type(str(path))
+        mime = guessed or "application/octet-stream"
+    if mime in ("text/plain", "application/octet-stream"):
+        override = _EXT_MIME_OVERRIDES.get(path.suffix.lower())
+        if override:
+            return override
+    return mime
 
 # --- Content extractors ---
 
@@ -310,87 +368,122 @@ def extract_exif(path: Path, mime: str) -> dict:
     return {}
 
 # --- Indexing ---
+#
+# Indexing splits into two phases that can run independently:
+#   1. Extraction (stat, MIME, chunk text, EXIF) — pure per-file work,
+#      no DB access. Farmed out to a process pool.
+#   2. Writing — single-threaded, one SQLite connection, drains results
+#      as the pool completes them.
+# SQLite on a single connection does not parallelize writes, so there's
+# no benefit to a second writer; the win is keeping the writer fed while
+# extraction runs on N cores.
 
-def checksum(path: Path) -> str:
-    """Stream the full file into the hash — no cap. Streaming keeps memory
-    bounded regardless of file size, so there's no reason to truncate."""
-    h = hashlib.blake2b(digest_size=8)
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def needs_reindex(con: sqlite3.Connection, path: Path, force: bool) -> bool:
-    if force:
-        return True
-    stat = path.stat()
-    row = con.execute("SELECT mtime FROM files WHERE path=?", (str(path),)).fetchone()
-    return row is None or row["mtime"] != stat.st_mtime
-
-def index_file(con: sqlite3.Connection, path: Path, force: bool = False):
-    if not needs_reindex(con, path, force):
-        return
-
+def _extract_for_index(path_str: str) -> dict:
+    """Worker function: all work that doesn't touch the DB. Runs in a
+    child process. Returns a dict that the writer consumes, or raises on
+    unexpected failure (the main loop catches and logs)."""
+    path = Path(path_str)
     stat = path.stat()
     mime = detect_mime(path)
-    csum = checksum(path)
-    now = time.time()
+    chunks = list(extract_chunks(path, mime))
+    exif = extract_exif(path, mime)
+    return {
+        "path": path_str,
+        "mtime": stat.st_mtime,
+        "size": stat.st_size,
+        "mime": mime,
+        "chunks": chunks,
+        "exif": exif,
+    }
 
-    con.execute("""
-        INSERT OR REPLACE INTO files(path, mtime, size, mime, checksum, indexed_at)
-        VALUES (?,?,?,?,?,?)
-    """, (str(path), stat.st_mtime, stat.st_size, mime, csum, now))
 
-    # Chunks + contentless FTS. Drop old chunk rows for this file first;
-    # the FTS rowid mirrors chunks.id so we remove its entries in lockstep.
+def _write_indexed(con: sqlite3.Connection, data: dict):
+    """Apply one extracted file's results to the DB. Drops prior chunk
+    rows for the path so re-indexing is idempotent; the FTS rowid mirrors
+    chunks.id so we delete from `content` in lockstep."""
+    path = data["path"]
     old_ids = [r[0] for r in con.execute(
-        "SELECT id FROM chunks WHERE path=?", (str(path),)).fetchall()]
+        "SELECT id FROM chunks WHERE path=?", (path,)).fetchall()]
     if old_ids:
         con.executemany(
             "DELETE FROM content WHERE rowid=?", [(i,) for i in old_ids])
         con.executemany(
             "DELETE FROM embeddings WHERE chunk_id=?", [(i,) for i in old_ids])
-        con.execute("DELETE FROM chunks WHERE path=?", (str(path),))
+        con.execute("DELETE FROM chunks WHERE path=?", (path,))
 
-    for idx, off, length, chunk_text in extract_chunks(path, mime):
+    con.execute(
+        "INSERT OR REPLACE INTO files(path, mtime, size, mime, indexed_at) "
+        "VALUES (?,?,?,?,?)",
+        (path, data["mtime"], data["size"], data["mime"], time.time()))
+
+    for idx, off, length, chunk_text in data["chunks"]:
         cur = con.execute(
             "INSERT INTO chunks(path, chunk_index, byte_offset, byte_length) "
             "VALUES (?,?,?,?)",
-            (str(path), idx, off, length))
+            (path, idx, off, length))
         con.execute(
             "INSERT INTO content(rowid, text) VALUES (?, ?)",
             (cur.lastrowid, chunk_text))
 
-    # EXIF / extracted metadata
-    con.execute("DELETE FROM metadata WHERE path=? AND source != 'user'", (str(path),))
-    for k, v in extract_exif(path, mime).items():
-        con.execute("""
-            INSERT OR REPLACE INTO metadata(path, key, value, source)
-            VALUES (?,?,?,'exif')
-        """, (str(path), k, v))
+    con.execute("DELETE FROM metadata WHERE path=? AND source != 'user'", (path,))
+    for k, v in data["exif"].items():
+        con.execute(
+            "INSERT OR REPLACE INTO metadata(path, key, value, source) "
+            "VALUES (?,?,?,'exif')",
+            (path, k, v))
+
 
 def index_tree(root: Path, fados_dir: Path, force: bool = False):
     con = db_connect(fados_dir)
-    IGNORE = IGNORE_DIRS
-    count = 0
-    errors = 0
-    t0 = time.time()
+
+    # Pre-load existing mtimes so the change check is one query, not one
+    # per file. On a full reindex we skip the load and treat everything
+    # as stale.
+    existing = {}
+    if not force:
+        existing = {r["path"]: r["mtime"] for r in
+                    con.execute("SELECT path, mtime FROM files").fetchall()}
+
+    todo: list[str] = []
     for path in root.rglob("*"):
-        if any(part in IGNORE for part in path.parts):
+        if any(part in IGNORE_DIRS for part in path.parts):
             continue
         if not path.is_file():
             continue
         try:
-            index_file(con, path, force)
-            count += 1
-            if count % 500 == 0:
-                con.commit()
-                elapsed = time.time() - t0
-                print(f"  indexing: {count} files ({elapsed:.0f}s)...",
-                      file=sys.stderr, flush=True)
-        except Exception as e:
-            errors += 1
-            print(f"  error: {path}: {e}", file=sys.stderr)
+            mt = path.stat().st_mtime
+        except OSError:
+            continue
+        path_str = str(path)
+        if force or existing.get(path_str) != mt:
+            todo.append(path_str)
+
+    if not todo:
+        con.close()
+        print("nothing to index", file=sys.stderr)
+        return
+
+    max_workers = min(os.cpu_count() or 4, 16)
+    print(f"indexing {len(todo)} files with {max_workers} workers...",
+          file=sys.stderr)
+    t0 = time.time()
+    count = 0
+    errors = 0
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_extract_for_index, p): p for p in todo}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            try:
+                _write_indexed(con, fut.result())
+                count += 1
+                if count % 1000 == 0:
+                    con.commit()
+                    elapsed = time.time() - t0
+                    print(f"  indexing: {count}/{len(todo)} ({elapsed:.0f}s)...",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                errors += 1
+                print(f"  error: {p}: {e}", file=sys.stderr)
     con.commit()
     con.close()
     elapsed = time.time() - t0
@@ -523,9 +616,23 @@ def _embed(text: str) -> bytes:
     vec = _get_model().encode(text, normalize_embeddings=True)
     return vec.astype(np.float32).tobytes()
 
+
+# Batch size for embedding: collect this many chunk texts, then call
+# model.encode() once. Bigger = better GPU/CPU utilization but more RAM.
+# 256 is a reasonable balance for MiniLM-L6-v2 on CPU.
+EMBED_BATCH = 256
+
+
 def embed_tree(root: Path, fados_dir: Path):
     """Generate / refresh embeddings for all chunks under root. Chunk
-    text is re-read from the filesystem — the DB doesn't hold it."""
+    text is re-read from the filesystem — the DB doesn't hold it.
+
+    Batches chunk texts through model.encode() instead of encoding one
+    at a time; on CPU this is typically an order of magnitude faster
+    because the transformer amortizes Python/tensor overhead across the
+    batch."""
+    import numpy as np
+
     con = db_connect(fados_dir)
     rows = con.execute(
         "SELECT c.id, c.path, c.byte_offset, c.byte_length, f.mime "
@@ -535,34 +642,57 @@ def embed_tree(root: Path, fados_dir: Path):
     ).fetchall()
     total = len(rows)
     print(f"embedding {total} chunks...", file=sys.stderr)
-    errors = 0
-    skipped = 0
+    model = _get_model()
     t0 = time.time()
-    for i, row in enumerate(rows, 1):
+    done = 0
+    skipped = 0
+    errors = 0
+    pending_texts: list[str] = []
+    pending_ids: list[int] = []
+
+    def flush():
+        nonlocal done
+        if not pending_texts:
+            return
+        vecs = model.encode(
+            pending_texts,
+            normalize_embeddings=True,
+            batch_size=64,
+            show_progress_bar=False,
+        )
+        con.executemany(
+            "INSERT OR REPLACE INTO embeddings(chunk_id, vector) VALUES (?,?)",
+            [(cid, np.asarray(v, dtype=np.float32).tobytes())
+             for cid, v in zip(pending_ids, vecs)],
+        )
+        con.commit()
+        done += len(pending_ids)
+        pending_texts.clear()
+        pending_ids.clear()
+        elapsed = time.time() - t0
+        print(f"  embedding: {done}/{total} ({elapsed:.0f}s)...",
+              file=sys.stderr, flush=True)
+
+    for row in rows:
         try:
             text = _read_chunk_text(row["path"], row["byte_offset"],
                                     row["byte_length"], row["mime"])
-            if not text:
-                skipped += 1
-                continue
-            vec_bytes = _embed(text)
-            con.execute(
-                "INSERT OR REPLACE INTO embeddings(chunk_id, vector) VALUES (?,?)",
-                (row["id"], vec_bytes),
-            )
-            if i % 50 == 0:
-                con.commit()
-                elapsed = time.time() - t0
-                print(f"  embedding: {i}/{total} ({elapsed:.0f}s)...",
-                      file=sys.stderr, flush=True)
         except Exception as e:
             errors += 1
             print(f"  error chunk {row['id']} ({row['path']}): {e}",
                   file=sys.stderr)
-    con.commit()
+            continue
+        if not text:
+            skipped += 1
+            continue
+        pending_texts.append(text)
+        pending_ids.append(row["id"])
+        if len(pending_texts) >= EMBED_BATCH:
+            flush()
+    flush()
     con.close()
     elapsed = time.time() - t0
-    msg = f"embedded {total - errors - skipped} chunks in {elapsed:.1f}s"
+    msg = f"embedded {done} chunks in {elapsed:.1f}s"
     if skipped:
         msg += f" ({skipped} skipped — source unreadable)"
     if errors:
@@ -798,7 +928,7 @@ def watch(root: Path, fados_dir: Path):
         path = Path(line.strip())
         if path.is_file():
             try:
-                index_file(con, path, force=True)
+                _write_indexed(con, _extract_for_index(str(path)))
                 con.commit()
                 print(f"  reindexed: {path}")
             except Exception as e:
