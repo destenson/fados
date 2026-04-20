@@ -713,6 +713,141 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False,
         msg += f" ({errors} errors)"
     print(msg, file=sys.stderr)
 
+# --- Query-time freshness ---
+#
+# Files on disk drift out of sync with the index as they're edited. Rather
+# than re-walk the whole tree on every query, we stat just the files that
+# appear in a result set and inline-reindex any whose mtime advanced past
+# what we recorded at index time. Bounded at REFRESH_MAX_SYNC so huge SQL
+# queries don't hide surprise latency.
+#
+# Embeddings are intentionally NOT regenerated synchronously: loading the
+# transformer model takes seconds and most queries don't need fresh
+# embeddings immediately. _write_indexed drops stale embeddings, then we
+# spawn a detached `fados embed` that only touches chunks without
+# embeddings — so by the user's next semantic query the file has caught up.
+
+REFRESH_MAX_SYNC = 500
+
+
+def _refresh_stale_paths(con: sqlite3.Connection, paths) -> int:
+    """Stat `paths`, reindex any where the file's current mtime is newer
+    than its recorded indexed_at. Returns count reindexed."""
+    if not paths:
+        return 0
+    unique = list({p for p in paths if p})
+    placeholders = ",".join("?" * len(unique))
+    rows = con.execute(
+        f"SELECT path, indexed_at FROM files WHERE path IN ({placeholders})",
+        unique,
+    ).fetchall()
+    stale: list[str] = []
+    for r in rows:
+        try:
+            mt = Path(r["path"]).stat().st_mtime
+        except OSError:
+            continue
+        if mt > r["indexed_at"]:
+            stale.append(r["path"])
+    if not stale:
+        return 0
+    datas: list[dict] = []
+    for p in stale:
+        try:
+            datas.append(_extract_fast(p))
+        except Exception:
+            continue
+    want = [d["path"] for d in datas if _wants_exif(d["mime"])]
+    exif_map = batch_exiftool(want) if want else {}
+    refreshed = 0
+    for d in datas:
+        d["exif"] = exif_map.get(d["path"], {})
+        try:
+            _write_indexed(con, d)
+            refreshed += 1
+        except Exception:
+            pass
+    if refreshed:
+        con.commit()
+    return refreshed
+
+
+def _spawn_async_embed(fados_dir: Path):
+    """Fire off a detached `fados embed` so newly-indexed chunks get
+    embeddings without blocking the query. No output, no wait, survives
+    parent exit."""
+    script = Path(__file__).resolve()
+    if fados_dir.resolve() == USER_FADOS_DIR.resolve():
+        cmd = [sys.executable, str(script), "--user", "embed"]
+    else:
+        cmd = [sys.executable, str(script), "--dir",
+               str(fados_dir.parent), "embed"]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
+
+def _annotate_staleness(fados_dir: Path, results: list[dict]):
+    """Tag each result whose on-disk file has drifted past the index.
+    Adds `stale: true` and `stale_by_seconds` (file mtime - indexed_at).
+    Harmless to call after a refresh pass: refreshed files won't trip
+    the check."""
+    if not results:
+        return
+    paths = list({r["path"] for r in results if r.get("path")})
+    if not paths:
+        return
+    placeholders = ",".join("?" * len(paths))
+    con = db_connect(fados_dir)
+    indexed_at = {r["path"]: r["indexed_at"] for r in con.execute(
+        f"SELECT path, indexed_at FROM files WHERE path IN ({placeholders})",
+        paths,
+    ).fetchall()}
+    con.close()
+    mtimes: dict = {}
+    for p in paths:
+        try:
+            mtimes[p] = Path(p).stat().st_mtime
+        except OSError:
+            continue
+    for r in results:
+        p = r.get("path")
+        idx = indexed_at.get(p)
+        mt = mtimes.get(p)
+        if idx is None or mt is None:
+            continue
+        if mt > idx:
+            r["stale"] = True
+            r["stale_by_seconds"] = round(mt - idx, 1)
+
+
+def _refresh_and_spawn(fados_dir: Path, paths) -> int:
+    """Combined refresh pass used by search/semantic/similar: opens its
+    own short-lived connection so it doesn't contend with the caller's
+    open cursors."""
+    unique_paths = {p for p in paths if p}
+    if not unique_paths or len(unique_paths) > REFRESH_MAX_SYNC:
+        return 0
+    con = db_connect(fados_dir)
+    try:
+        refreshed = _refresh_stale_paths(con, list(unique_paths))
+    finally:
+        con.close()
+    if refreshed:
+        print(f"  refreshed {refreshed} stale file(s); embeddings updating "
+              f"in background", file=sys.stderr)
+        _spawn_async_embed(fados_dir)
+    return refreshed
+
+
 # --- Query ---
 
 def query(sql: str, fados_dir: Path, params=()):
@@ -769,18 +904,23 @@ def _make_snippet(text: str, terms: str, width: int = 200) -> str:
 
 
 def search(terms: str, fados_dir: Path, n: int = 20):
-    con = db_connect(fados_dir)
-    rows = con.execute(
-        "SELECT c.path, c.byte_offset, c.byte_length, f.mime, "
-        "       bm25(content) AS rank "
-        "FROM content "
-        "JOIN chunks c ON c.id = content.rowid "
-        "LEFT JOIN files f ON f.path = c.path "
-        "WHERE content MATCH ? "
-        "ORDER BY rank LIMIT ?",
-        (terms, n),
-    ).fetchall()
-    con.close()
+    def _run():
+        con = db_connect(fados_dir)
+        rows = con.execute(
+            "SELECT c.path, c.byte_offset, c.byte_length, f.mime, "
+            "       bm25(content) AS rank "
+            "FROM content "
+            "JOIN chunks c ON c.id = content.rowid "
+            "LEFT JOIN files f ON f.path = c.path "
+            "WHERE content MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (terms, n),
+        ).fetchall()
+        con.close()
+        return rows
+    rows = _run()
+    if _refresh_and_spawn(fados_dir, [r["path"] for r in rows]):
+        rows = _run()
     results = []
     for r in rows:
         text = _read_chunk_text(r["path"], r["byte_offset"],
@@ -792,6 +932,7 @@ def search(terms: str, fados_dir: Path, n: int = 20):
             "snippet": _make_snippet(text or "", terms),
             "rank": round(r["rank"], 4),
         })
+    _annotate_staleness(fados_dir, results)
     return results
 
 def find_meta(key: str, value: str, fados_dir: Path):
@@ -855,10 +996,17 @@ def embed_tree(root: Path, fados_dir: Path):
     import numpy as np
 
     con = db_connect(fados_dir)
+    # NOT EXISTS filter makes embed incremental: only chunks that don't
+    # already have an embedding get re-encoded. _write_indexed drops a
+    # file's old embeddings when it re-ingests the file after a stale
+    # refresh, so those rows re-appear here and get picked up on the
+    # next embed pass without blowing away embeddings for untouched
+    # files.
     rows = con.execute(
         "SELECT c.id, c.path, c.byte_offset, c.byte_length, f.mime "
         "FROM chunks c LEFT JOIN files f ON f.path = c.path "
-        "WHERE c.path LIKE ?",
+        "WHERE c.path LIKE ? "
+        "  AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.chunk_id = c.id)",
         (str(root.resolve()) + "%",)
     ).fetchall()
     total = len(rows)
@@ -955,12 +1103,16 @@ def semantic(query_text: str, fados_dir: Path, n: int = 20) -> list:
     all stored chunk embeddings. Dedupes to the best chunk per file."""
     import numpy as np
     q_vec = np.frombuffer(_embed(query_text), dtype=np.float32)
-    con = db_connect(fados_dir)
-    scored = _score_chunks(q_vec, con)
-    con.close()
-    if not scored:
+    def _run():
+        con = db_connect(fados_dir)
+        scored = _score_chunks(q_vec, con)
+        con.close()
+        return _dedupe_best_per_path(scored, n) if scored else []
+    top = _run()
+    if top and _refresh_and_spawn(fados_dir, [r["path"] for _, r in top]):
+        top = _run()
+    if not top:
         return []
-    top = _dedupe_best_per_path(scored, n)
     out = []
     for score, r in top:
         text = _read_chunk_text(r["path"], r["byte_offset"],
@@ -972,6 +1124,7 @@ def semantic(query_text: str, fados_dir: Path, n: int = 20) -> list:
             "snippet": _make_snippet(text or "", query_text),
             "score": round(score, 4),
         })
+    _annotate_staleness(fados_dir, out)
     return out
 
 
@@ -979,38 +1132,48 @@ def similar(path: str, fados_dir: Path, n: int = 10) -> list:
     """Find files whose chunks most resemble any chunk of the given
     file. File-level rank is the max similarity across chunk pairs."""
     import numpy as np
-    con = db_connect(fados_dir)
-    src_rows = con.execute(
-        "SELECT e.vector FROM embeddings e "
-        "JOIN chunks c ON c.id = e.chunk_id WHERE c.path=?",
-        (path,)
-    ).fetchall()
-    if not src_rows:
+
+    def _run():
+        con = db_connect(fados_dir)
+        src_rows = con.execute(
+            "SELECT e.vector FROM embeddings e "
+            "JOIN chunks c ON c.id = e.chunk_id WHERE c.path=?",
+            (path,)
+        ).fetchall()
+        if not src_rows:
+            con.close()
+            return None, []
+        src_vecs = [np.frombuffer(r["vector"], dtype=np.float32) for r in src_rows]
+        other_rows = con.execute(
+            "SELECT c.path, c.byte_offset, c.byte_length, f.mime, e.vector "
+            "FROM embeddings e "
+            "JOIN chunks c ON c.id = e.chunk_id "
+            "LEFT JOIN files f ON f.path = c.path "
+            "WHERE c.path != ?",
+            (path,)
+        ).fetchall()
         con.close()
+        best = {}
+        for r in other_rows:
+            v = np.frombuffer(r["vector"], dtype=np.float32)
+            s = max(float(np.dot(sv, v)) for sv in src_vecs)
+            cur = best.get(r["path"])
+            if cur is None or s > cur[0]:
+                best[r["path"]] = (s, r)
+        ranked = sorted(best.values(), key=lambda x: x[0], reverse=True)[:n]
+        return src_vecs, ranked
+    src_vecs, ranked = _run()
+    if src_vecs is None:
         return []
-    src_vecs = [np.frombuffer(r["vector"], dtype=np.float32) for r in src_rows]
-    other_rows = con.execute(
-        "SELECT c.path, c.byte_offset, c.byte_length, f.mime, e.vector "
-        "FROM embeddings e "
-        "JOIN chunks c ON c.id = e.chunk_id "
-        "LEFT JOIN files f ON f.path = c.path "
-        "WHERE c.path != ?",
-        (path,)
-    ).fetchall()
-    con.close()
-    best = {}
-    for r in other_rows:
-        v = np.frombuffer(r["vector"], dtype=np.float32)
-        s = max(float(np.dot(sv, v)) for sv in src_vecs)
-        cur = best.get(r["path"])
-        if cur is None or s > cur[0]:
-            best[r["path"]] = (s, r)
-    ranked = sorted(best.values(), key=lambda x: x[0], reverse=True)[:n]
-    return [
+    if ranked and _refresh_and_spawn(fados_dir, [r["path"] for _, r in ranked] + [path]):
+        _, ranked = _run()
+    out = [
         {"path": r["path"], "byte_offset": r["byte_offset"],
          "byte_length": r["byte_length"], "score": round(s, 4)}
         for s, r in ranked
     ]
+    _annotate_staleness(fados_dir, out)
+    return out
 
 # --- Intent-based search (ripgrep) ---
 
