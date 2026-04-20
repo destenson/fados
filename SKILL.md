@@ -1,10 +1,17 @@
 ---
 description: >
-  Intent-based search (find where something is defined, its implementation, its docs, or its
-  tests — not just every mention), semantic/conceptual search by meaning, find files similar
-  to a reference file, query file metadata (dates, sizes, MIME types, EXIF), tag/annotate
-  files for later retrieval, or run SQL over a file tree. Useful for conceptual queries, document collections, research papers,
-  images, or structured file metadata.
+  Explore, discover, or query any directory tree — including unfamiliar ones like
+  /usr/share/doc, ~/src, research paper folders, or document collections. Use when
+  asked "what's in this directory", "explore this tree", "summarize what's under X",
+  "find files about <concept>", "find similar files to <file>", or when grep is too
+  noisy and you want the *right* hit, not every mention. Covers intent-based search
+  (where something is defined vs. implemented vs. documented vs. tested),
+  semantic/conceptual search by meaning, similar-file discovery, file metadata
+  queries (dates, sizes, MIME, EXIF), tagging/annotation, and raw SQL over a file
+  tree. Indexes are git-style — a `.fados/` in any parent of CWD is auto-discovered,
+  so common trees (~, ~/src, project roots) are usually already queryable without
+  any setup. Prefer this over grep/find/ls for corpus exploration, conceptual queries,
+  document collections, research papers, images, or any non-trivial directory tree.
 ---
 
 # FADOS — Filesystem As Database Overlay
@@ -18,9 +25,18 @@ source tree, and snippets are re-read from disk at query time. The
 index is always rebuildable from the source tree.
 
 Indexing happens automatically on first run. The index is stored at `<path>/.fados/index.db`,
-colocated with the data. Query commands discover the index by walking up from CWD (git-style).
-Use `--dir <path>` to target a specific directory, or `--user` to use `~/.fados/` instead.
+colocated with the data. Query commands discover the index by walking up from CWD **git-style** —
+if any parent directory of CWD contains a `.fados/`, it's used automatically, no flags needed.
+Use `--dir <path>` to target a specific tree from outside, or `--user` for `~/.fados/`.
 These flags go **before** the command: `uv run scripts/fados.py --dir /some/path search foo`.
+
+**Before reindexing, assume an index already exists.** `.fados/` is git-style:
+walk-up finds it for free, and common trees (`~`, `~/src`, project roots) are
+typically already indexed. Check with `ls -d <path>/.fados/index.db` before
+proposing a rebuild. `reindex` is expensive; `refresh` is incremental and
+usually what's wanted for a known-stale index.
+
+Stdout is NDJSON; all logs/progress go to stderr, so piping through `jq` is safe.
 
 ## When to invoke
 
@@ -82,6 +98,7 @@ The script path is relative to this SKILL.md file.
 | Command | Purpose |
 |---------|---------|
 | `reindex [path] [--embed]` | Force full reindex (path overrides --dir) |
+| `refresh [path]` | Prune missing/ignored files and reindex changed ones (cheaper than reindex) |
 | `embed [path]` | Generate/refresh semantic embeddings for indexed content |
 
 ---
