@@ -780,6 +780,77 @@ def _refresh_stale_paths(con: sqlite3.Connection, paths) -> int:
     return refreshed
 
 
+def _delete_file_rows(con: sqlite3.Connection, path: str):
+    """Fully evict a file from the index: chunks + FTS + embeddings +
+    metadata + tags + the files row itself. Used by `refresh` when a
+    path now fails the ignore rules or is missing from disk."""
+    ids = [r[0] for r in con.execute(
+        "SELECT id FROM chunks WHERE path=?", (path,)).fetchall()]
+    if ids:
+        con.executemany(
+            "DELETE FROM content WHERE rowid=?", [(i,) for i in ids])
+        con.executemany(
+            "DELETE FROM embeddings WHERE chunk_id=?", [(i,) for i in ids])
+    con.execute("DELETE FROM chunks WHERE path=?", (path,))
+    con.execute("DELETE FROM metadata WHERE path=?", (path,))
+    con.execute("DELETE FROM tags WHERE path=?", (path,))
+    con.execute("DELETE FROM files WHERE path=?", (path,))
+
+
+def refresh_tree(root: Path, fados_dir: Path,
+                 include_hidden: bool = False,
+                 include_deps: bool = False):
+    """Reapply ignore rules and freshen mtimes across the existing
+    index. Drops rows that now fail the ignore rules or whose file is
+    gone from disk; reindexes files whose on-disk mtime has advanced
+    past our recorded indexed_at.
+
+    This is the operation you want after tightening ignore rules
+    (e.g. expanding DEP_DIRS or adding a hidden-dir filter) or after
+    pruning files — a full `reindex` would miss the deletions because
+    change detection only adds/updates."""
+    con = db_connect(fados_dir)
+    rows = con.execute("SELECT path, indexed_at FROM files").fetchall()
+    removed = 0
+    stale: list[str] = []
+    for r in rows:
+        p = r["path"]
+        path = Path(p)
+        try:
+            rel = path.relative_to(root).parts
+            ignored = _should_ignore(rel, include_hidden, include_deps)
+        except ValueError:
+            ignored = False
+        if ignored:
+            _delete_file_rows(con, p)
+            removed += 1
+            continue
+        try:
+            mt = path.stat().st_mtime
+        except OSError:
+            _delete_file_rows(con, p)
+            removed += 1
+            continue
+        if mt > r["indexed_at"]:
+            stale.append(p)
+    con.commit()
+
+    reindexed = 0
+    if stale:
+        # Chunk through _refresh_stale_paths to stay under SQLite's
+        # default 999-parameter limit on the WHERE path IN (...) probe.
+        STRIDE = 500
+        for i in range(0, len(stale), STRIDE):
+            reindexed += _refresh_stale_paths(con, stale[i:i + STRIDE])
+    con.close()
+
+    msg = f"refresh: {removed} removed"
+    if reindexed:
+        msg += f", {reindexed} reindexed (embeddings updating in background)"
+        _spawn_async_embed(fados_dir)
+    print(msg, file=sys.stderr)
+
+
 def _spawn_async_embed(fados_dir: Path):
     """Fire off a detached `fados embed` so newly-indexed chunks get
     embeddings without blocking the query. No output, no wait, survives
