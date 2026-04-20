@@ -9,9 +9,13 @@ description: >
 
 # FADOS — Filesystem As Database Overlay
 
-FADOS indexes a directory into a disposable SQLite database, enabling full-text, metadata,
-and semantic (vector) search over files — without moving or modifying them. The index is
-always rebuildable from the source tree.
+FADOS is a lightweight queryable overlay on a filesystem. It indexes a
+directory into a disposable SQLite database, enabling full-text,
+metadata, and semantic (vector) search over files — without moving,
+modifying, or duplicating them. The DB never stores file contents: it
+holds only pointers `(path, byte_offset, byte_length)` back into the
+source tree, and snippets are re-read from disk at query time. The
+index is always rebuildable from the source tree.
 
 Indexing happens automatically on first run. The index is stored at `<path>/.fados/index.db`,
 colocated with the data. Query commands discover the index by walking up from CWD (git-style).
@@ -112,14 +116,27 @@ The `query` command accepts SQL against these tables:
 | checksum | TEXT | BLAKE2b content hash |
 | indexed_at | REAL | When this file was last indexed |
 
-**content** — FTS5 virtual table for full-text search
-| Column | Description |
-|--------|-------------|
-| path | File path (unindexed, for joining) |
-| text | Extracted text content |
+**chunks** — one row per indexed fragment. `id` matches `content.rowid`
+and `embeddings.chunk_id`.
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER (PK) | Stable chunk id |
+| path | TEXT | File this chunk came from |
+| chunk_index | INTEGER | Ordinal within the file |
+| byte_offset | INTEGER | Start byte in the source file |
+| byte_length | INTEGER | Length in bytes |
 
-Use `text MATCH 'term'` for FTS5 queries, `snippet(content, 1, '[', ']', '...', 20)` for
-highlighted excerpts.
+**content** — contentless FTS5 virtual table. Holds only the inverted
+index; there is no `text` column to select. Query via `content MATCH 'term'`
+and JOIN `chunks ON chunks.id = content.rowid` to recover the location;
+re-read the bytes from disk to render a snippet. `snippet()` is not
+available on contentless tables.
+
+**embeddings** — one vector per chunk.
+| Column | Type | Description |
+|--------|------|-------------|
+| chunk_id | INTEGER (PK) | Matches `chunks.id` |
+| vector | BLOB | Normalized float32 embedding |
 
 **metadata** — key-value pairs extracted from files or added by users
 | Column | Description |
@@ -143,20 +160,25 @@ highlighted excerpts.
 All commands return newline-delimited JSON. Every result includes `path`.
 
 ```jsonc
-// semantic / similar — includes similarity score [0.0-1.0]
-{"path": "papers/attention.pdf", "score": 0.8821}
+// search — FTS hit with chunk location and a snippet re-read from disk
+{"path": "notes/ml.md", "byte_offset": 4096, "byte_length": 4096,
+ "snippet": "...the [gradient descent] optimizer...", "rank": -5.21}
 
-// search — includes snippet with context
-{"path": "notes/ml.md", "snippet": "...the [gradient descent] optimizer..."}
+// semantic — chunk-level cosine hit, deduped to best chunk per file
+{"path": "papers/attention.pdf", "byte_offset": 0, "byte_length": 12288,
+ "snippet": "...self-[attention] layers...", "score": 0.8821}
 
-// definition / implementation / documentation / tests — includes line number and matched text
+// similar — no snippet, just the top chunk's location + score
+{"path": "papers/attention.pdf", "byte_offset": 0, "byte_length": 12288, "score": 0.78}
+
+// definition / implementation / documentation / tests — line + matched text
 {"path": "src/model.py", "line": 42, "match": "class ModelConfig:"}
 
 // query — returns selected columns
 {"path": "README.md", "mime": "text/markdown", "size": 4096}
 
-// info — full detail for one file
-// (pretty-printed JSON with "file", "metadata", "tags" keys)
+// info — full detail for one file, including chunk and embedding counts
+// (pretty-printed JSON with "file", "metadata", "tags", "chunks" keys)
 ```
 
 ---
@@ -174,11 +196,12 @@ uv run scripts/fados.py similar papers/attention.pdf -n 5
 uv run scripts/fados.py search "gradient descent fine-tuning"
 
 # Markdown files modified in the last 30 days mentioning LoRA
-uv run scripts/fados.py query "SELECT f.path FROM files f
-  JOIN content c ON c.path = f.path
+uv run scripts/fados.py query "SELECT DISTINCT f.path FROM files f
+  JOIN chunks ch ON ch.path = f.path
+  JOIN content co ON co.rowid = ch.id
   WHERE f.mime = 'text/markdown'
     AND f.mtime > strftime('%s','now','-30 days')
-    AND c.text MATCH 'LoRA'"
+    AND content MATCH 'LoRA'"
 
 # Find by EXIF/extracted metadata
 uv run scripts/fados.py find Author "Vaswani"

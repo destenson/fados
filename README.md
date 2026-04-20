@@ -1,9 +1,11 @@
 # Filesystem-as-database Overlay System (fados)
 
-This is a simple proof-of-concept script that indexes the current working
-directory into a disposable SQLite database, enabling full-text, metadata, and
-semantic (vector) search over files — without moving or modifying them. The
-index is always rebuildable from the source tree.
+This is a simple proof-of-concept script that builds a lightweight
+queryable overlay on top of a filesystem, enabling full-text, metadata,
+and semantic (vector) search over files — without moving, modifying, or
+duplicating them. The index holds only pointers (path + byte offset +
+length) back into the source tree; snippets are re-read from disk at
+query time. The index is always rebuildable from the source tree.
 
 ## Core Principles
 
@@ -125,12 +127,17 @@ The SQLite index lives at `<indexed-path>/.fados/index.db` (or `~/.fados/index.d
 with `--user`) and contains:
 
 - `files` — path, mtime, size, MIME type, checksum
-- `content` — FTS5 full-text index of extracted file content
+- `chunks` — `(path, chunk_index, byte_offset, byte_length)` pointers to
+  every indexed fragment back in the source file
+- `content` — **contentless** FTS5 inverted index (no stored text).
+  `content.rowid = chunks.id`, so matches resolve to a byte range on disk
+- `embeddings` — one vector per chunk, keyed by `chunks.id`
 - `metadata` — arbitrary key/value pairs (EXIF, user-supplied, inferred)
 - `tags` — user and inferred tags
-- `embeddings` — binary sentence-transformer vectors for semantic search
 
-The index is a cache. Delete it and run `reindex` again to start fresh.
+The index never stores file contents. Snippets are re-read from the
+source file at query time using the chunk's byte range. The index is a
+cache — delete it and run `reindex` to start fresh.
 
 ## Index Location
 

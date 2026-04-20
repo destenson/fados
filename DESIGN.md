@@ -21,7 +21,7 @@ owning the data. The filesystem is ground truth. The index is disposable and alw
 ## Architecture
 
 ```
-Source Tree (read-only)
+Source Tree (read-only, source of truth)
     /projects/
     /documents/
     /photos/
@@ -31,21 +31,29 @@ Source Tree (read-only)
     tika / exiftool / pdftotext / pandoc / ffprobe
         │
         ▼
-  Index (SQLite, local)
+  Index (SQLite, local — no file contents, only pointers)
     files(path, mtime, size, mime, checksum)
-    content(path, text)           ← FTS5
-    metadata(path, key, value)    ← extracted + user-supplied
+    chunks(id, path, chunk_index, byte_offset, byte_length)
+    content USING fts5(text, content='')     ← contentless FTS5
+    embeddings(chunk_id, vector)             ← per-chunk vectors
+    metadata(path, key, value)               ← extracted + user
     tags(path, tag)
         │
         ▼
   Query Layer
-    SQL dialect + filesystem-native shortcuts
+    FTS MATCH → chunk rowid → re-read bytes from disk for snippet
+    cosine over embeddings → chunk rowid → source file
     rg / find for predicate pushdown
         │
         ▼
   Result Interface
     CLI / Python API / HTTP (agent tool calls)
 ```
+
+The index never holds file contents. It stores the inverted FTS index,
+per-chunk embedding vectors, and `(path, byte_offset, byte_length)`
+pointers back into the source tree. Snippet rendering re-reads the
+relevant byte range from disk at query time.
 
 ---
 
@@ -54,15 +62,38 @@ Source Tree (read-only)
 ```sql
 CREATE TABLE files (
     path        TEXT PRIMARY KEY,
-    mtime       INTEGER,
+    mtime       REAL,
     size        INTEGER,
     mime        TEXT,
     checksum    TEXT,
-    indexed_at  INTEGER
+    indexed_at  REAL
 );
 
--- Full-text search over extracted content
-CREATE VIRTUAL TABLE content USING fts5(path, text);
+-- Every indexed fragment of a file. For text/* files byte_offset and
+-- byte_length refer to the file's own bytes so snippets can be re-read
+-- directly; for PDF/office/etc. the byte range spans the whole source
+-- file and chunk_index distinguishes fragments.
+CREATE TABLE chunks (
+    id          INTEGER PRIMARY KEY,
+    path        TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    byte_length INTEGER NOT NULL,
+    UNIQUE (path, chunk_index)
+);
+
+-- Contentless FTS5: the inverted index only — no stored text. rowid is
+-- the matching chunks.id, so matches resolve to a byte range in the
+-- source file on disk.
+CREATE VIRTUAL TABLE content USING fts5(
+    text, content='', contentless_delete=1
+);
+
+-- One vector per chunk (not per file). chunk_id = chunks.id = content rowid.
+CREATE TABLE embeddings (
+    chunk_id INTEGER PRIMARY KEY,
+    vector   BLOB
+);
 
 -- Arbitrary key-value metadata (extracted + user-supplied)
 -- source: 'extracted' | 'exif' | 'user' | 'inferred'
@@ -81,6 +112,14 @@ CREATE TABLE tags (
     PRIMARY KEY (path, tag)
 );
 ```
+
+### Chunking
+
+Text files are split into ~4 KiB windows with 800-byte overlap, snapping
+each window edge to a UTF-8 code-point boundary. Each window becomes one
+`chunks` row, one contentless FTS5 document, and (once `embed` runs) one
+embedding vector. The overlap keeps concepts that straddle a boundary
+visible to semantic search.
 
 ---
 
@@ -151,17 +190,21 @@ based on result set size and index freshness.
 ```
 file detected / changed
     │
-    ├─ stat() → files table (mtime, size)
+    ├─ stat() → files table (mtime, size, mime, checksum)
     ├─ mime detection (python-magic)
     ├─ content extraction (dispatcher by mime)
-    │     text/*          → read directly
+    │     text/*          → read bytes directly
     │     application/pdf → pdftotext
     │     image/*         → exiftool + optional OCR
     │     office docs     → pandoc / tika
     │     video/*         → ffprobe for metadata
-    │     code            → read directly, language tagged
+    │     code            → read bytes directly, language tagged
     │
-    ├─ content → FTS5
+    ├─ chunk → (chunk_index, byte_offset, byte_length, text)
+    │     chunks row for each window
+    │     text tokens → contentless FTS5 (rowid = chunks.id)
+    │     vector      → embeddings (once `embed` runs)
+    │
     └─ extracted metadata → metadata table
 ```
 
@@ -216,13 +259,13 @@ All commands return newline-delimited JSON with `path` in every result record, s
 reference files directly.
 
 ```
-fados query <sql>               → [{path, mime, mtime, snippet, ...}]
-fados info <path>               → {file, metadata, tags}
+fados query <sql>               → [{path, mime, mtime, ...}]
+fados info <path>               → {file, metadata, tags, chunks}
 fados tag <path> <tag>          → (silent on success)
 fados annotate <path> <k> <v>   → (silent on success)
-fados search <terms>            → [{path, snippet}]
-fados semantic <query> [-n N]   → [{path, score}]
-fados similar <path> [-n N]     → [{path, score}]
+fados search <terms> [-n N]     → [{path, byte_offset, byte_length, snippet, rank}]
+fados semantic <query> [-n N]   → [{path, byte_offset, byte_length, snippet, score}]
+fados similar <path> [-n N]     → [{path, byte_offset, byte_length, score}]
 ```
 
 > **Future (low priority)**: An MCP server or HTTP API could wrap the CLI for networked or

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "click",
-#     "python-magic",
-# ]
-# ///
 """
 FADOS - Filesystem As Database Overlay System
 Single-file prototype. Run with: uv run scripts/fados.py <command> [args]
+
+Dependencies come from pyproject.toml. Semantic commands (embed,
+semantic, similar) additionally need the `semantic` extra:
+    uv sync --extra semantic
 
 Auto-indexes CWD on first run. Index stored in <path>/.fados/index.db.
 Use --user for ~/.fados/ instead.
@@ -172,11 +169,33 @@ CREATE TABLE IF NOT EXISTS tags (
     source  TEXT DEFAULT 'user',
     PRIMARY KEY (path, tag)
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS content USING fts5(path UNINDEXED, text);
-CREATE TABLE IF NOT EXISTS embeddings (
-    path    TEXT PRIMARY KEY,
-    vector  BLOB
+-- chunks: a chunk is the granularity at which both FTS tokens and
+-- embeddings live. chunks.id is the rowid used by `content` (contentless
+-- FTS5) and by `embeddings`. byte_offset/byte_length point back into the
+-- source file; for non-text files extracted via pdftotext/pandoc those
+-- span the whole file and chunk_index disambiguates across chunks.
+CREATE TABLE IF NOT EXISTS chunks (
+    id          INTEGER PRIMARY KEY,
+    path        TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    byte_length INTEGER NOT NULL,
+    UNIQUE (path, chunk_index)
 );
+CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+
+-- Contentless FTS5: stores the inverted index only, not the text. The
+-- source file on disk is the authoritative copy; snippets are re-read
+-- from there via chunks.byte_offset/byte_length at query time.
+CREATE VIRTUAL TABLE IF NOT EXISTS content USING fts5(
+    text, content='', contentless_delete=1
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id INTEGER PRIMARY KEY,
+    vector   BLOB
+);
+
 CREATE INDEX IF NOT EXISTS idx_meta_key ON metadata(key, value);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 """
@@ -213,9 +232,39 @@ def run(cmd: list[str], input_path: Path) -> Optional[str]:
     except Exception:
         return None
 
-def extract_text(path: Path, mime: str) -> Optional[str]:
-    if mime.startswith("text/"):
-        return path.read_text(errors="replace")
+# Chunk sizing targets MiniLM-L6-v2's 256-token context (~1000 chars of
+# English text). The overlap keeps concepts that straddle a boundary from
+# being invisible to semantic search.
+CHUNK_BYTES = 4096
+CHUNK_OVERLAP_BYTES = 800
+
+
+def _chunk_bytes_utf8(raw: bytes):
+    """Yield (byte_offset, byte_length, text) windows over a UTF-8 byte
+    string, snapping window edges to code-point boundaries so we never
+    emit a mojibake-prefixed chunk."""
+    n = len(raw)
+    if n == 0:
+        return
+    i = 0
+    while i < n:
+        end = min(i + CHUNK_BYTES, n)
+        # Walk forward off any UTF-8 continuation bytes so we cut at a
+        # code point boundary.
+        while end < n and (raw[end] & 0xC0) == 0x80:
+            end += 1
+        text = raw[i:end].decode("utf-8", errors="replace")
+        yield i, end - i, text
+        if end >= n:
+            break
+        step = max(1, CHUNK_BYTES - CHUNK_OVERLAP_BYTES)
+        i += step
+        while i < n and (raw[i] & 0xC0) == 0x80:
+            i += 1
+
+
+def _extract_non_text(path: Path, mime: str) -> Optional[str]:
+    """Best-effort plaintext extraction for non-text MIME types."""
     if mime == "application/pdf":
         try:
             result = subprocess.run(
@@ -231,6 +280,29 @@ def extract_text(path: Path, mime: str) -> Optional[str]:
     if mime.startswith("application/vnd.oasis"):
         return run(["pandoc", "--to=plain"], path)
     return None
+
+
+def extract_chunks(path: Path, mime: str):
+    """Yield (chunk_index, byte_offset, byte_length, text) for a file.
+
+    For text/* files byte_offset/byte_length refer to the file's own
+    bytes, so snippets can be re-read directly. For non-text files the
+    byte range spans the whole source file (chunk_index distinguishes
+    individual chunks) and snippet rendering must re-extract via the
+    same tool."""
+    if mime.startswith("text/"):
+        with path.open("rb") as f:
+            raw = f.read()
+        for idx, (off, length, text) in enumerate(_chunk_bytes_utf8(raw)):
+            yield idx, off, length, text
+        return
+    text = _extract_non_text(path, mime)
+    if not text:
+        return
+    size = path.stat().st_size
+    raw = text.encode("utf-8")
+    for idx, (_, _, chunk_text) in enumerate(_chunk_bytes_utf8(raw)):
+        yield idx, 0, size, chunk_text
 
 def extract_exif(path: Path) -> dict:
     """Extract EXIF/file metadata via exiftool as flat key:value dict."""
@@ -252,8 +324,12 @@ def extract_exif(path: Path) -> dict:
 # --- Indexing ---
 
 def checksum(path: Path) -> str:
+    """Stream the full file into the hash — no cap. Streaming keeps memory
+    bounded regardless of file size, so there's no reason to truncate."""
     h = hashlib.blake2b(digest_size=8)
-    h.update(path.read_bytes())
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
     return h.hexdigest()
 
 def needs_reindex(con: sqlite3.Connection, path: Path, force: bool) -> bool:
@@ -277,11 +353,25 @@ def index_file(con: sqlite3.Connection, path: Path, force: bool = False):
         VALUES (?,?,?,?,?,?)
     """, (str(path), stat.st_mtime, stat.st_size, mime, csum, now))
 
-    # Content
-    text = extract_text(path, mime)
-    con.execute("DELETE FROM content WHERE path=?", (str(path),))
-    if text:
-        con.execute("INSERT INTO content(path, text) VALUES (?,?)", (str(path), text))
+    # Chunks + contentless FTS. Drop old chunk rows for this file first;
+    # the FTS rowid mirrors chunks.id so we remove its entries in lockstep.
+    old_ids = [r[0] for r in con.execute(
+        "SELECT id FROM chunks WHERE path=?", (str(path),)).fetchall()]
+    if old_ids:
+        con.executemany(
+            "DELETE FROM content WHERE rowid=?", [(i,) for i in old_ids])
+        con.executemany(
+            "DELETE FROM embeddings WHERE chunk_id=?", [(i,) for i in old_ids])
+        con.execute("DELETE FROM chunks WHERE path=?", (str(path),))
+
+    for idx, off, length, chunk_text in extract_chunks(path, mime):
+        cur = con.execute(
+            "INSERT INTO chunks(path, chunk_index, byte_offset, byte_length) "
+            "VALUES (?,?,?,?)",
+            (str(path), idx, off, length))
+        con.execute(
+            "INSERT INTO content(rowid, text) VALUES (?, ?)",
+            (cur.lastrowid, chunk_text))
 
     # EXIF / extracted metadata
     con.execute("DELETE FROM metadata WHERE path=? AND source != 'user'", (str(path),))
@@ -331,13 +421,76 @@ def query(sql: str, fados_dir: Path, params=()):
     finally:
         con.close()
 
-def search(terms: str, fados_dir: Path):
-    return query(
-        "SELECT path, snippet(content, 1, '[', ']', '...', 20) AS snippet "
-        "FROM content WHERE text MATCH ? ORDER BY rank",
-        fados_dir,
-        (terms,)
-    )
+def _read_chunk_text(path: str, byte_offset: int, byte_length: int,
+                     mime: Optional[str] = None) -> Optional[str]:
+    """Re-read a chunk's text from the source file. Returns None if the
+    file is gone or the byte range no longer exists."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        if mime is None or mime.startswith("text/"):
+            with p.open("rb") as f:
+                f.seek(byte_offset)
+                raw = f.read(byte_length)
+            return raw.decode("utf-8", errors="replace")
+        # Non-text: byte range spans the whole file, so we re-extract and
+        # return the concatenated plaintext. Callers still have only
+        # chunk-index granularity here — good enough for snippet display.
+        return _extract_non_text(p, mime)
+    except OSError:
+        return None
+
+
+def _make_snippet(text: str, terms: str, width: int = 200) -> str:
+    """Return a ~width-char slice of text centered on the first term hit,
+    with each matching term wrapped in [ ]. Tokens shorter than 3 chars
+    are skipped for highlighting so 'a'/'on'/'in' don't light up every
+    word in the snippet."""
+    if not text:
+        return ""
+    toks = [t for t in re.findall(r"\w+", terms) if len(t) >= 3]
+    lower = text.lower()
+    hit = -1
+    for t in toks:
+        j = lower.find(t.lower())
+        if j != -1 and (hit == -1 or j < hit):
+            hit = j
+    if hit == -1:
+        snippet = text[:width]
+    else:
+        start = max(0, hit - width // 2)
+        snippet = text[start:start + width]
+    for t in toks:
+        snippet = re.sub(rf"(?i)\b({re.escape(t)})\b", r"[\1]", snippet)
+    return snippet.strip()
+
+
+def search(terms: str, fados_dir: Path, n: int = 20):
+    con = db_connect(fados_dir)
+    rows = con.execute(
+        "SELECT c.path, c.byte_offset, c.byte_length, f.mime, "
+        "       bm25(content) AS rank "
+        "FROM content "
+        "JOIN chunks c ON c.id = content.rowid "
+        "LEFT JOIN files f ON f.path = c.path "
+        "WHERE content MATCH ? "
+        "ORDER BY rank LIMIT ?",
+        (terms, n),
+    ).fetchall()
+    con.close()
+    results = []
+    for r in rows:
+        text = _read_chunk_text(r["path"], r["byte_offset"],
+                                r["byte_length"], r["mime"])
+        results.append({
+            "path": r["path"],
+            "byte_offset": r["byte_offset"],
+            "byte_length": r["byte_length"],
+            "snippet": _make_snippet(text or "", terms),
+            "rank": round(r["rank"], 4),
+        })
+    return results
 
 def find_meta(key: str, value: str, fados_dir: Path):
     return query(
@@ -352,42 +505,63 @@ def find_meta(key: str, value: str, fados_dir: Path):
 
 _model = None
 
+
+def _require_semantic_deps():
+    """Import numpy + sentence_transformers or exit with an install hint."""
+    try:
+        import numpy  # noqa: F401
+        import sentence_transformers  # noqa: F401
+    except ImportError as e:
+        print(f"error: semantic commands need the 'semantic' extra "
+              f"(missing: {e.name}). Install with: uv sync --extra semantic",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 def _get_model():
     global _model
     if _model is None:
+        _require_semantic_deps()
         from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer("all-MiniLM-L6-v2")
     return _model
 
+
 def _embed(text: str) -> bytes:
+    # Don't pre-truncate — the model's tokenizer already truncates to its
+    # own max_seq_length. Adding an arbitrary char-level cap on top just
+    # hides a second, invisible truncation with a number we made up.
     import numpy as np
-    vec = _get_model().encode(text[:8192], normalize_embeddings=True)
+    vec = _get_model().encode(text, normalize_embeddings=True)
     return vec.astype(np.float32).tobytes()
 
-def _store_embedding(con: sqlite3.Connection, path: Path, text: str):
-    vec_bytes = _embed(text)
-    con.execute(
-        "INSERT OR REPLACE INTO embeddings(path, vector) VALUES (?,?)",
-        (str(path), vec_bytes)
-    )
-
 def embed_tree(root: Path, fados_dir: Path):
-    """Generate / refresh embeddings for all indexed text content under root."""
-    import numpy as np
+    """Generate / refresh embeddings for all chunks under root. Chunk
+    text is re-read from the filesystem — the DB doesn't hold it."""
     con = db_connect(fados_dir)
     rows = con.execute(
-        "SELECT c.path, c.text FROM content c "
-        "JOIN files f ON f.path = c.path "
-        "WHERE f.path LIKE ?",
+        "SELECT c.id, c.path, c.byte_offset, c.byte_length, f.mime "
+        "FROM chunks c LEFT JOIN files f ON f.path = c.path "
+        "WHERE c.path LIKE ?",
         (str(root.resolve()) + "%",)
     ).fetchall()
     total = len(rows)
-    print(f"embedding {total} files...", file=sys.stderr)
+    print(f"embedding {total} chunks...", file=sys.stderr)
     errors = 0
+    skipped = 0
     t0 = time.time()
     for i, row in enumerate(rows, 1):
         try:
-            _store_embedding(con, Path(row["path"]), row["text"])
+            text = _read_chunk_text(row["path"], row["byte_offset"],
+                                    row["byte_length"], row["mime"])
+            if not text:
+                skipped += 1
+                continue
+            vec_bytes = _embed(text)
+            con.execute(
+                "INSERT OR REPLACE INTO embeddings(chunk_id, vector) VALUES (?,?)",
+                (row["id"], vec_bytes),
+            )
             if i % 50 == 0:
                 con.commit()
                 elapsed = time.time() - t0
@@ -395,50 +569,109 @@ def embed_tree(root: Path, fados_dir: Path):
                       file=sys.stderr, flush=True)
         except Exception as e:
             errors += 1
-            print(f"  error {row['path']}: {e}", file=sys.stderr)
+            print(f"  error chunk {row['id']} ({row['path']}): {e}",
+                  file=sys.stderr)
     con.commit()
     con.close()
     elapsed = time.time() - t0
-    msg = f"embedded {total - errors} files in {elapsed:.1f}s"
+    msg = f"embedded {total - errors - skipped} chunks in {elapsed:.1f}s"
+    if skipped:
+        msg += f" ({skipped} skipped — source unreadable)"
     if errors:
         msg += f" ({errors} errors)"
     print(msg, file=sys.stderr)
 
+
+def _score_chunks(q_vec, con: sqlite3.Connection):
+    """Return [(score, chunk_row)] for every chunk with an embedding."""
+    import numpy as np
+    rows = con.execute(
+        "SELECT c.id, c.path, c.byte_offset, c.byte_length, f.mime, e.vector "
+        "FROM embeddings e "
+        "JOIN chunks c ON c.id = e.chunk_id "
+        "LEFT JOIN files f ON f.path = c.path"
+    ).fetchall()
+    scored = []
+    for r in rows:
+        v = np.frombuffer(r["vector"], dtype=np.float32)
+        scored.append((float(np.dot(q_vec, v)), r))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return scored
+
+
+def _dedupe_best_per_path(scored, n: int):
+    """Keep the single best-scoring chunk per path, top n."""
+    seen = {}
+    for score, r in scored:
+        if r["path"] in seen:
+            continue
+        seen[r["path"]] = (score, r)
+        if len(seen) >= n:
+            break
+    return list(seen.values())
+
+
 def semantic(query_text: str, fados_dir: Path, n: int = 20) -> list:
-    """Semantic search using cosine similarity over stored embeddings."""
+    """Semantic search: cosine similarity of the query embedding against
+    all stored chunk embeddings. Dedupes to the best chunk per file."""
     import numpy as np
     q_vec = np.frombuffer(_embed(query_text), dtype=np.float32)
     con = db_connect(fados_dir)
-    rows = con.execute("SELECT path, vector FROM embeddings").fetchall()
+    scored = _score_chunks(q_vec, con)
     con.close()
-    if not rows:
+    if not scored:
         return []
-    scores = []
-    for row in rows:
-        v = np.frombuffer(row["vector"], dtype=np.float32)
-        scores.append((float(np.dot(q_vec, v)), row["path"]))
-    scores.sort(reverse=True)
-    return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
+    top = _dedupe_best_per_path(scored, n)
+    out = []
+    for score, r in top:
+        text = _read_chunk_text(r["path"], r["byte_offset"],
+                                r["byte_length"], r["mime"])
+        out.append({
+            "path": r["path"],
+            "byte_offset": r["byte_offset"],
+            "byte_length": r["byte_length"],
+            "snippet": _make_snippet(text or "", query_text),
+            "score": round(score, 4),
+        })
+    return out
+
 
 def similar(path: str, fados_dir: Path, n: int = 10) -> list:
-    """Find files with content similar to the given path."""
+    """Find files whose chunks most resemble any chunk of the given
+    file. File-level rank is the max similarity across chunk pairs."""
     import numpy as np
     con = db_connect(fados_dir)
-    row = con.execute("SELECT vector FROM embeddings WHERE path=?", (path,)).fetchone()
-    if not row:
+    src_rows = con.execute(
+        "SELECT e.vector FROM embeddings e "
+        "JOIN chunks c ON c.id = e.chunk_id WHERE c.path=?",
+        (path,)
+    ).fetchall()
+    if not src_rows:
         con.close()
         return []
-    q_vec = np.frombuffer(row["vector"], dtype=np.float32)
-    rows = con.execute(
-        "SELECT path, vector FROM embeddings WHERE path!=?", (path,)
+    src_vecs = [np.frombuffer(r["vector"], dtype=np.float32) for r in src_rows]
+    other_rows = con.execute(
+        "SELECT c.path, c.byte_offset, c.byte_length, f.mime, e.vector "
+        "FROM embeddings e "
+        "JOIN chunks c ON c.id = e.chunk_id "
+        "LEFT JOIN files f ON f.path = c.path "
+        "WHERE c.path != ?",
+        (path,)
     ).fetchall()
     con.close()
-    scores = [
-        (float(np.dot(q_vec, np.frombuffer(r["vector"], dtype=np.float32))), r["path"])
-        for r in rows
+    best = {}
+    for r in other_rows:
+        v = np.frombuffer(r["vector"], dtype=np.float32)
+        s = max(float(np.dot(sv, v)) for sv in src_vecs)
+        cur = best.get(r["path"])
+        if cur is None or s > cur[0]:
+            best[r["path"]] = (s, r)
+    ranked = sorted(best.values(), key=lambda x: x[0], reverse=True)[:n]
+    return [
+        {"path": r["path"], "byte_offset": r["byte_offset"],
+         "byte_length": r["byte_length"], "score": round(s, 4)}
+        for s, r in ranked
     ]
-    scores.sort(reverse=True)
-    return [{"path": p, "score": round(s, 4)} for s, p in scores[:n]]
 
 # --- Intent-based search (ripgrep) ---
 
@@ -470,22 +703,29 @@ def _rg(pattern: str, root: Path, *,
     cmd.append(str(root))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        results = []
-        for line in result.stdout.strip().split('\n'):
-            if not line:
-                continue
-            parts = line.split(':', 2)
-            if len(parts) >= 3:
-                results.append({
-                    "path": parts[0],
-                    "line": int(parts[1]),
-                    "match": parts[2].strip()
-                })
-                if len(results) >= max_results:
-                    break
-        return results
-    except Exception:
+    except FileNotFoundError:
+        # Surface a useful error instead of pretending there were zero hits.
+        print("error: ripgrep (rg) not found on PATH", file=sys.stderr)
         return []
+    except subprocess.TimeoutExpired:
+        print(f"warning: ripgrep timed out after 30s scanning {root}",
+              file=sys.stderr)
+        return []
+    results = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        parts = line.split(':', 2)
+        if len(parts) >= 3:
+            try:
+                lineno = int(parts[1])
+            except ValueError:
+                continue
+            results.append({"path": parts[0], "line": lineno,
+                            "match": parts[2].strip()})
+            if len(results) >= max_results:
+                break
+    return results
 
 
 def search_definition(term: str, root: Path, n: int = 20) -> list[dict]:
@@ -540,11 +780,19 @@ def info(path: str, fados_dir: Path):
     file_row = con.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
     meta = con.execute("SELECT key, value, source FROM metadata WHERE path=?", (path,)).fetchall()
     tags_ = con.execute("SELECT tag, source FROM tags WHERE path=?", (path,)).fetchall()
+    chunk_stats = con.execute(
+        "SELECT COUNT(*) AS n_chunks, "
+        "       (SELECT COUNT(*) FROM embeddings e "
+        "        JOIN chunks c ON c.id = e.chunk_id WHERE c.path=?) AS n_embedded "
+        "FROM chunks WHERE path=?",
+        (path, path)
+    ).fetchone()
     con.close()
     return {
         "file": dict(file_row) if file_row else None,
         "metadata": [dict(r) for r in meta],
         "tags": [dict(r) for r in tags_],
+        "chunks": dict(chunk_stats) if chunk_stats else None,
     }
 
 # --- Watch (inotifywait) ---
@@ -678,19 +926,20 @@ def query_cmd(ctx, sql):
 
 @cli.command("search")
 @click.argument("terms", nargs=-1, required=True)
+@click.option("-n", default=20, help="Max results.")
 @click.pass_context
-def search_cmd(ctx, terms):
+def search_cmd(ctx, terms, n):
     """Full-text keyword search (FTS5)."""
     c = _resolve_ctx(ctx)
     c.auto_index_if_needed()
-    results = search(" ".join(terms), c.fados_dir)
+    results = search(" ".join(terms), c.fados_dir, n)
     hint = ""
-    if not results and _table_count(c.fados_dir, "content") == 0:
+    if not results and _table_count(c.fados_dir, "chunks") == 0:
         n_files = _table_count(c.fados_dir, "files")
         if n_files == 0:
             hint = "index is empty; run: fados --dir <path> reindex"
         else:
-            hint = f"{n_files} files indexed but no text content extracted"
+            hint = f"{n_files} files indexed but no chunks were extracted"
     print_results(results, empty_hint=hint)
 
 
@@ -726,10 +975,14 @@ def similar_cmd(ctx, file, n):
             hint = "no embeddings generated; run: fados --dir <path> embed"
         else:
             con = sqlite3.connect(c.fados_dir / "index.db")
-            row = con.execute("SELECT 1 FROM embeddings WHERE path=?", (resolved,)).fetchone()
+            row = con.execute(
+                "SELECT 1 FROM embeddings e "
+                "JOIN chunks c ON c.id = e.chunk_id WHERE c.path=?",
+                (resolved,)
+            ).fetchone()
             con.close()
             if not row:
-                hint = f"no embedding for '{file}' — file may not be indexed"
+                hint = f"no embedding for '{file}' — file may not be indexed, or embeddings haven't been generated"
     print_results(results, empty_hint=hint)
 
 
