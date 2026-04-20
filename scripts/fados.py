@@ -12,6 +12,7 @@ Use --user for ~/.fados/ instead.
 
 Commands:
   reindex [--embed]         force full reindex
+  refresh                   prune missing/ignored files and reindex changed ones (cheaper than reindex)
   embed                     generate/refresh semantic embeddings for indexed content
   query <sql>               raw SQL against the index
   search <terms>            full-text keyword search (FTS5)

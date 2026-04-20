@@ -30,7 +30,7 @@ if any parent directory of CWD contains a `.fados/`, it's used automatically, no
 Use `--dir <path>` to target a specific tree from outside, or `--user` for `~/.fados/`.
 These flags go **before** the command: `uv run scripts/fados.py --dir /some/path search foo`.
 
-**Before reindexing, assume an index already exists.** `.fados/` is git-style:
+**Before reindexing, an index probably already exists.** `.fados/` is git-style:
 walk-up finds it for free, and common trees (`~`, `~/src`, project roots) are
 typically already indexed. Check with `ls -d <path>/.fados/index.db` before
 proposing a rebuild. `reindex` is expensive; `refresh` is incremental and
