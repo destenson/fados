@@ -44,8 +44,45 @@ import click
 
 # --- Config ---
 
-IGNORE_DIRS = {".git", ".fados", "__pycache__", "node_modules", "target", ".venv"}
+# Directories that never contain anything worth indexing and never should
+# even when the user opts into hidden files. VCS internals, bytecode
+# caches, test-runner caches — all derivable from source, none legible.
+HARD_IGNORE_DIRS = {
+    ".git", ".fados", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+}
+
+# Dependency / build-output dirs. Skipped by default because they bloat
+# the index with generated or third-party code, but occasionally the
+# library source inside is exactly what the user wants to search — so
+# `--deps` on reindex opts them in.
+DEP_DIRS = {
+    "node_modules", "target", ".venv", "venv",
+    "dist", "build", ".next", ".nuxt",
+}
+
+# Legacy name retained for the ripgrep wrappers: they always exclude
+# both sets since interactive code search rarely wants either.
+IGNORE_DIRS = HARD_IGNORE_DIRS | DEP_DIRS
+
 USER_FADOS_DIR = Path.home() / ".fados"
+
+
+def _should_ignore(rel_parts: tuple, include_hidden: bool,
+                   include_deps: bool) -> bool:
+    """Return True if any path component means 'don't index this'.
+
+    `rel_parts` is the path split into components *relative to the
+    indexed root*, so a root like `~/.config` doesn't trigger the
+    hidden-dir filter on the root itself."""
+    for part in rel_parts:
+        if part in HARD_IGNORE_DIRS:
+            return True
+        if not include_deps and part in DEP_DIRS:
+            return True
+        if not include_hidden and part.startswith(".") and part not in (".", ".."):
+            return True
+    return False
 
 def _find_local_fados_dir() -> Optional[Path]:
     """Walk up from CWD looking for .fados/, git-style. Stops before ~/."""
@@ -62,12 +99,14 @@ def _find_local_fados_dir() -> Optional[Path]:
 
 MAX_AUTO_INDEX_ENTRIES = 10_000
 
-def _count_tree(root: Path, limit: int) -> int:
+def _count_tree(root: Path, limit: int,
+                include_hidden: bool = False,
+                include_deps: bool = False) -> int:
     """Count files under root, stopping early once limit is exceeded."""
-    ignore = IGNORE_DIRS
     count = 0
     for path in root.rglob("*"):
-        if any(part in ignore for part in path.parts):
+        if _should_ignore(path.relative_to(root).parts,
+                          include_hidden, include_deps):
             continue
         if path.is_file():
             count += 1
@@ -534,7 +573,9 @@ def _write_indexed(con: sqlite3.Connection, data: dict):
             (path, k, v))
 
 
-def index_tree(root: Path, fados_dir: Path, force: bool = False):
+def index_tree(root: Path, fados_dir: Path, force: bool = False,
+               include_hidden: bool = False,
+               include_deps: bool = False):
     con = db_connect(fados_dir)
 
     # Pre-load existing mtimes so the change check is one query, not one
@@ -547,7 +588,8 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False):
 
     todo: list[str] = []
     for path in root.rglob("*"):
-        if any(part in IGNORE_DIRS for part in path.parts):
+        if _should_ignore(path.relative_to(root).parts,
+                          include_hidden, include_deps):
             continue
         if not path.is_file():
             continue
@@ -1175,11 +1217,16 @@ def _resolve_ctx(ctx, path_override: Optional[Path] = None) -> Context:
 @cli.command()
 @click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--embed", "do_embed", is_flag=True, help="Also generate embeddings.")
+@click.option("--hidden", "include_hidden", is_flag=True,
+              help="Include dot-prefixed files and directories (except hard-ignored ones like .git, __pycache__).")
+@click.option("--deps", "include_deps", is_flag=True,
+              help="Include dependency/build dirs (node_modules, target, .venv, dist, build, ...).")
 @click.pass_context
-def reindex(ctx, path, do_embed):
+def reindex(ctx, path, do_embed, include_hidden, include_deps):
     """Force a full reindex of the tree."""
     c = _resolve_ctx(ctx, path)
-    index_tree(c.root, c.fados_dir, force=True)
+    index_tree(c.root, c.fados_dir, force=True,
+               include_hidden=include_hidden, include_deps=include_deps)
     if do_embed:
         embed_tree(c.root, c.fados_dir)
 
