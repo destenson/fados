@@ -75,24 +75,6 @@ def _count_tree(root: Path, limit: int) -> int:
                 return count
     return count
 
-def resolve_fados_dir(*, user: bool = False,
-                      dir_override: Optional[Path] = None) -> Path:
-    """Determine where .fados/ lives.
-
-    --user flag:    always ~/.fados/
-    --dir override: <dir>/.fados/
-    default:        walk up from CWD to find .fados/, or CWD/.fados/ for auto-index
-    """
-    if user:
-        return USER_FADOS_DIR
-    if dir_override is not None:
-        return dir_override.resolve() / ".fados"
-    found = _find_local_fados_dir()
-    if found:
-        return found
-    # No existing index — will auto-index from CWD
-    return Path.cwd().resolve() / ".fados"
-
 def _is_indexing_in_progress(fados_dir: Path) -> bool:
     """Check if another process is currently indexing (holds a write lock)."""
     db_path = fados_dir / "index.db"
@@ -126,14 +108,14 @@ def _needs_auto_index(fados_dir: Path) -> bool:
     except Exception:
         return True
 
-def _auto_index(fados_dir: Path):
-    """Auto-index CWD on first run. Bail if the tree is too large or indexing is in progress."""
+def _auto_index(fados_dir: Path, root: Path):
+    """Auto-index `root` on first run. Bail if the tree is too large or
+    indexing is in progress."""
     if _is_indexing_in_progress(fados_dir):
         print("indexing is already in progress (another process holds the DB lock). "
               "Wait for it to finish, then retry.",
               file=sys.stderr)
         sys.exit(1)
-    root = fados_dir.parent
     count = _count_tree(root, MAX_AUTO_INDEX_ENTRIES)
     if count > MAX_AUTO_INDEX_ENTRIES:
         print(f"error: {root} has more than {MAX_AUTO_INDEX_ENTRIES} files. "
@@ -847,14 +829,16 @@ def print_results(rows: list, *, empty_hint: str = ""):
 
 
 class Context:
-    """Resolved --dir/--user into fados_dir and root for all subcommands."""
-    def __init__(self, fados_dir: Path):
+    """fados_dir (where the DB lives) and root (what gets indexed).
+    These are deliberately independent — e.g. `--user` puts the DB at
+    ~/.fados while `root` is still the tree the user wants to query."""
+    def __init__(self, fados_dir: Path, root: Path):
         self.fados_dir = fados_dir
-        self.root = fados_dir.parent
+        self.root = root
 
     def auto_index_if_needed(self):
         if _needs_auto_index(self.fados_dir):
-            _auto_index(self.fados_dir)
+            _auto_index(self.fados_dir, self.root)
 
 
 pass_ctx = click.make_pass_decorator(Context)
@@ -874,10 +858,44 @@ def cli(ctx, user, dir_):
 
 
 def _resolve_ctx(ctx, path_override: Optional[Path] = None) -> Context:
-    """Build Context, letting a subcommand's positional path override --dir."""
-    dir_override = path_override or ctx.obj["dir"]
-    fados_dir = resolve_fados_dir(user=ctx.obj["user"], dir_override=dir_override)
-    return Context(fados_dir)
+    """Build Context. fados_dir and root are derived independently so
+    `--user` doesn't accidentally force $HOME as the indexing root.
+
+    fados_dir (where index.db lives):
+      --user             → ~/.fados/
+      --dir <d>          → <d>/.fados/
+      positional <p>     → <p>/.fados/ (reindex/embed/watch only)
+      otherwise          → walk up from CWD, else CWD/.fados/
+
+    root (what to index/query-against):
+      positional <p>     → <p>
+      --dir <d>          → <d>
+      --user (no path)   → CWD
+      otherwise          → parent of fados_dir
+    """
+    user = ctx.obj["user"]
+    dir_ = ctx.obj["dir"]
+
+    if user:
+        fados_dir = USER_FADOS_DIR
+    elif path_override is not None:
+        fados_dir = path_override.resolve() / ".fados"
+    elif dir_ is not None:
+        fados_dir = dir_.resolve() / ".fados"
+    else:
+        found = _find_local_fados_dir()
+        fados_dir = found if found else Path.cwd().resolve() / ".fados"
+
+    if path_override is not None:
+        root = path_override.resolve()
+    elif dir_ is not None:
+        root = dir_.resolve()
+    elif user:
+        root = Path.cwd().resolve()
+    else:
+        root = fados_dir.parent
+
+    return Context(fados_dir, root)
 
 
 # --- Index commands (optional positional path, defaults to --dir / CWD) ---
