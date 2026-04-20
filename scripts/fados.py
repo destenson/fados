@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click",
+#     "python-magic",
+# ]
+# ///
 """
 FADOS - Filesystem As Database Overlay System
 Single-file prototype. Run with: uv run scripts/fados.py <command> [args]
@@ -89,12 +96,46 @@ def resolve_fados_dir(*, user: bool = False,
     # No existing index — will auto-index from CWD
     return Path.cwd().resolve() / ".fados"
 
+def _is_indexing_in_progress(fados_dir: Path) -> bool:
+    """Check if another process is currently indexing (holds a write lock)."""
+    db_path = fados_dir / "index.db"
+    if not db_path.exists():
+        return False
+    con = None
+    try:
+        con = sqlite3.connect(db_path, timeout=0.1)
+        # BEGIN IMMEDIATE fails with "database is locked" if another
+        # writer already holds the lock — that's our signal.
+        con.execute("BEGIN IMMEDIATE")
+        con.rollback()
+        return False
+    except sqlite3.OperationalError:
+        return True
+    finally:
+        if con is not None:
+            con.close()
+
+
 def _needs_auto_index(fados_dir: Path) -> bool:
-    """True if the index DB doesn't exist yet."""
-    return not (fados_dir / "index.db").exists()
+    """True if the index DB doesn't exist or has no indexed files."""
+    db_path = fados_dir / "index.db"
+    if not db_path.exists():
+        return True
+    try:
+        con = sqlite3.connect(db_path)
+        row = con.execute("SELECT COUNT(*) FROM files").fetchone()
+        con.close()
+        return row[0] == 0
+    except Exception:
+        return True
 
 def _auto_index(fados_dir: Path):
-    """Auto-index CWD on first run. Bail if the tree is too large."""
+    """Auto-index CWD on first run. Bail if the tree is too large or indexing is in progress."""
+    if _is_indexing_in_progress(fados_dir):
+        print("indexing is already in progress (another process holds the DB lock). "
+              "Wait for it to finish, then retry.",
+              file=sys.stderr)
+        sys.exit(1)
     root = fados_dir.parent
     count = _count_tree(root, MAX_AUTO_INDEX_ENTRIES)
     if count > MAX_AUTO_INDEX_ENTRIES:
@@ -255,6 +296,7 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False):
     IGNORE = IGNORE_DIRS
     count = 0
     errors = 0
+    t0 = time.time()
     for path in root.rglob("*"):
         if any(part in IGNORE for part in path.parts):
             continue
@@ -263,15 +305,21 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False):
         try:
             index_file(con, path, force)
             count += 1
-            if count % 100 == 0:
+            if count % 500 == 0:
                 con.commit()
-                print(f"  indexed {count}...", end="\r", flush=True)
+                elapsed = time.time() - t0
+                print(f"  indexing: {count} files ({elapsed:.0f}s)...",
+                      file=sys.stderr, flush=True)
         except Exception as e:
             errors += 1
             print(f"  error: {path}: {e}", file=sys.stderr)
     con.commit()
     con.close()
-    print(f"indexed {count} files ({errors} errors)")
+    elapsed = time.time() - t0
+    msg = f"indexed {count} files in {elapsed:.1f}s"
+    if errors:
+        msg += f" ({errors} errors)"
+    print(msg, file=sys.stderr)
 
 # --- Query ---
 
@@ -334,20 +382,27 @@ def embed_tree(root: Path, fados_dir: Path):
         (str(root.resolve()) + "%",)
     ).fetchall()
     total = len(rows)
-    print(f"embedding {total} files...")
+    print(f"embedding {total} files...", file=sys.stderr)
     errors = 0
+    t0 = time.time()
     for i, row in enumerate(rows, 1):
         try:
             _store_embedding(con, Path(row["path"]), row["text"])
-            if i % 10 == 0:
+            if i % 50 == 0:
                 con.commit()
-                print(f"  {i}/{total}", end="\r", flush=True)
+                elapsed = time.time() - t0
+                print(f"  embedding: {i}/{total} ({elapsed:.0f}s)...",
+                      file=sys.stderr, flush=True)
         except Exception as e:
             errors += 1
             print(f"  error {row['path']}: {e}", file=sys.stderr)
     con.commit()
     con.close()
-    print(f"\nembedded {total - errors} files ({errors} errors)")
+    elapsed = time.time() - t0
+    msg = f"embedded {total - errors} files in {elapsed:.1f}s"
+    if errors:
+        msg += f" ({errors} errors)"
+    print(msg, file=sys.stderr)
 
 def semantic(query_text: str, fados_dir: Path, n: int = 20) -> list:
     """Semantic search using cosine similarity over stored embeddings."""
@@ -515,9 +570,29 @@ def watch(root: Path, fados_dir: Path):
 
 # --- CLI ---
 
-def print_results(rows: list):
+def _resolve_indexed_path(file: str) -> str:
+    """Indexed paths are absolute (from root.rglob). Normalize user input
+    to match — relative paths would silently miss otherwise."""
+    return str(Path(file).resolve())
+
+
+def _table_count(fados_dir: Path, table: str) -> int:
+    """Return row count for a table, 0 if table doesn't exist."""
+    try:
+        con = sqlite3.connect(fados_dir / "index.db")
+        row = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        con.close()
+        return row[0]
+    except Exception:
+        return 0
+
+
+def print_results(rows: list, *, empty_hint: str = ""):
     if not rows:
-        print("(no results)")
+        if empty_hint:
+            print(f"(no results — {empty_hint})", file=sys.stderr)
+        else:
+            print("(no results)")
         return
     for row in rows:
         print(json.dumps(row, default=str))
@@ -608,7 +683,15 @@ def search_cmd(ctx, terms):
     """Full-text keyword search (FTS5)."""
     c = _resolve_ctx(ctx)
     c.auto_index_if_needed()
-    print_results(search(" ".join(terms), c.fados_dir))
+    results = search(" ".join(terms), c.fados_dir)
+    hint = ""
+    if not results and _table_count(c.fados_dir, "content") == 0:
+        n_files = _table_count(c.fados_dir, "files")
+        if n_files == 0:
+            hint = "index is empty; run: fados --dir <path> reindex"
+        else:
+            hint = f"{n_files} files indexed but no text content extracted"
+    print_results(results, empty_hint=hint)
 
 
 @cli.command("semantic")
@@ -619,7 +702,11 @@ def semantic_cmd(ctx, terms, n):
     """Semantic/conceptual search using embeddings."""
     c = _resolve_ctx(ctx)
     c.auto_index_if_needed()
-    print_results(semantic(" ".join(terms), c.fados_dir, n))
+    results = semantic(" ".join(terms), c.fados_dir, n)
+    hint = ""
+    if not results and _table_count(c.fados_dir, "embeddings") == 0:
+        hint = "no embeddings generated; run: fados --dir <path> embed"
+    print_results(results, empty_hint=hint)
 
 
 @cli.command("similar")
@@ -630,7 +717,20 @@ def similar_cmd(ctx, file, n):
     """Find files with similar content to a given file."""
     c = _resolve_ctx(ctx)
     c.auto_index_if_needed()
-    print_results(similar(file, c.fados_dir, n))
+    resolved = _resolve_indexed_path(file)
+    results = similar(resolved, c.fados_dir, n)
+    hint = ""
+    if not results:
+        n_embed = _table_count(c.fados_dir, "embeddings")
+        if n_embed == 0:
+            hint = "no embeddings generated; run: fados --dir <path> embed"
+        else:
+            con = sqlite3.connect(c.fados_dir / "index.db")
+            row = con.execute("SELECT 1 FROM embeddings WHERE path=?", (resolved,)).fetchone()
+            con.close()
+            if not row:
+                hint = f"no embedding for '{file}' — file may not be indexed"
+    print_results(results, empty_hint=hint)
 
 
 @cli.command("find")
@@ -641,10 +741,28 @@ def find_cmd(ctx, key, value):
     """Search metadata by key/value."""
     c = _resolve_ctx(ctx)
     c.auto_index_if_needed()
-    print_results(find_meta(key, value, c.fados_dir))
+    results = find_meta(key, value, c.fados_dir)
+    hint = ""
+    if not results and _table_count(c.fados_dir, "metadata") == 0:
+        n_files = _table_count(c.fados_dir, "files")
+        if n_files == 0:
+            hint = "index is empty; run: fados --dir <path> reindex"
+        else:
+            hint = "no metadata extracted — exiftool may not be installed"
+    print_results(results, empty_hint=hint)
 
 
 # --- Intent-based search (ripgrep, no index) ---
+
+def _rg_empty_hint(root: Path) -> str:
+    """Hint for when ripgrep-based commands return nothing."""
+    if not root.is_dir():
+        return f"search root '{root}' is not a directory"
+    import shutil
+    if not shutil.which("rg"):
+        return "ripgrep (rg) is not installed"
+    return ""
+
 
 @cli.command()
 @click.argument("term")
@@ -653,7 +771,8 @@ def find_cmd(ctx, key, value):
 def definition(ctx, term, n):
     """Find where a term is defined (class, function, type, const, etc.)."""
     c = _resolve_ctx(ctx)
-    print_results(search_definition(term, c.root, n))
+    results = search_definition(term, c.root, n)
+    print_results(results, empty_hint=_rg_empty_hint(c.root) or f"no definitions found for '{term}'")
 
 
 @cli.command()
@@ -663,7 +782,8 @@ def definition(ctx, term, n):
 def implementation(ctx, term, n):
     """Find usage in code (excludes tests and docs)."""
     c = _resolve_ctx(ctx)
-    print_results(search_implementation(term, c.root, n))
+    results = search_implementation(term, c.root, n)
+    print_results(results, empty_hint=_rg_empty_hint(c.root) or f"no implementation references found for '{term}'")
 
 
 @cli.command()
@@ -673,7 +793,8 @@ def implementation(ctx, term, n):
 def documentation(ctx, term, n):
     """Find references in docs (markdown, rst, etc.)."""
     c = _resolve_ctx(ctx)
-    print_results(search_documentation(term, c.root, n))
+    results = search_documentation(term, c.root, n)
+    print_results(results, empty_hint=_rg_empty_hint(c.root) or f"no documentation references found for '{term}'")
 
 
 @cli.command()
@@ -683,7 +804,8 @@ def documentation(ctx, term, n):
 def tests(ctx, term, n):
     """Find references in test files."""
     c = _resolve_ctx(ctx)
-    print_results(search_tests(term, c.root, n))
+    results = search_tests(term, c.root, n)
+    print_results(results, empty_hint=_rg_empty_hint(c.root) or f"no test references found for '{term}'")
 
 
 # --- File info and annotation ---
@@ -695,7 +817,7 @@ def tests(ctx, term, n):
 def tag_cmd(ctx, file, tag_name):
     """Add a user tag to a file."""
     c = _resolve_ctx(ctx)
-    tag(file, tag_name, c.fados_dir)
+    tag(_resolve_indexed_path(file), tag_name, c.fados_dir)
 
 
 @cli.command("annotate")
@@ -706,7 +828,7 @@ def tag_cmd(ctx, file, tag_name):
 def annotate_cmd(ctx, file, key, value):
     """Add arbitrary metadata to a file."""
     c = _resolve_ctx(ctx)
-    annotate(file, key, value, c.fados_dir)
+    annotate(_resolve_indexed_path(file), key, value, c.fados_dir)
 
 
 @cli.command("info")
@@ -715,7 +837,8 @@ def annotate_cmd(ctx, file, key, value):
 def info_cmd(ctx, file):
     """Show all indexed data for a file."""
     c = _resolve_ctx(ctx)
-    print(json.dumps(info(file, c.fados_dir), indent=2, default=str))
+    c.auto_index_if_needed()
+    print(json.dumps(info(_resolve_indexed_path(file), c.fados_dir), indent=2, default=str))
 
 
 if __name__ == "__main__":
