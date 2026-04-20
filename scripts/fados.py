@@ -232,21 +232,72 @@ def _assert_schema_compatible(con: sqlite3.Connection, db_path: Path):
 
 # --- MIME detection ---
 
-# libmagic reports many structured text formats as the generic "text/plain"
-# because they lack magic bytes. Override by extension so SQL filters like
-# `WHERE mime='text/markdown'` actually match.
-_EXT_MIME_OVERRIDES = {
+# Extension → MIME for files whose type is unambiguously determined by
+# extension. Checked before libmagic so common cases (.md, .py, .gz, .pdf,
+# ...) skip the header read entirely — that's the dominant per-file cost
+# on deep trees of mostly-plain-text files. Extensions not in this map
+# fall through to libmagic.
+_EXT_MIME_FAST = {
     ".md": "text/markdown",
     ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".log": "text/plain",
     ".rst": "text/x-rst",
     ".adoc": "text/asciidoc",
     ".org": "text/x-org",
+    ".tex": "text/x-tex",
     ".toml": "application/toml",
     ".yaml": "application/yaml",
     ".yml": "application/yaml",
+    ".json": "application/json",
+    ".jsonl": "application/json",
+    ".ndjson": "application/json",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".xml": "application/xml",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".ts": "application/typescript",
+    ".tsx": "application/typescript",
+    ".py": "text/x-script.python",
+    ".pyi": "text/x-script.python",
+    ".sh": "text/x-shellscript",
+    ".bash": "text/x-shellscript",
+    ".c": "text/x-c",
+    ".h": "text/x-c",
+    ".cpp": "text/x-c++",
+    ".cc": "text/x-c++",
+    ".hpp": "text/x-c++",
+    ".rs": "text/rust",
+    ".go": "text/x-go",
+    ".rb": "text/x-ruby",
+    ".java": "text/x-java",
+    ".kt": "text/x-kotlin",
+    ".sql": "application/sql",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".pdf": "application/pdf",
+    ".gz": "application/gzip",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
 }
 
+# libmagic sometimes returns generic text/plain for formats that lack
+# magic bytes (e.g. markdown). When that happens, re-override by
+# extension so `WHERE mime='text/markdown'`-style filters match.
+_EXT_MIME_OVERRIDES = _EXT_MIME_FAST
+
+
 def detect_mime(path: Path) -> str:
+    ext = path.suffix.lower()
+    fast = _EXT_MIME_FAST.get(ext)
+    if fast:
+        return fast
     try:
         import magic
         mime = magic.from_file(str(path), mime=True)
@@ -254,7 +305,7 @@ def detect_mime(path: Path) -> str:
         guessed, _ = mimetypes.guess_type(str(path))
         mime = guessed or "application/octet-stream"
     if mime in ("text/plain", "application/octet-stream"):
-        override = _EXT_MIME_OVERRIDES.get(path.suffix.lower())
+        override = _EXT_MIME_OVERRIDES.get(ext)
         if override:
             return override
     return mime
@@ -303,6 +354,12 @@ def _chunk_bytes_utf8(raw: bytes):
             i += 1
 
 
+# Cap on decompressed gzip output. Keeps a pathological gzip bomb from
+# ballooning memory, and keeps chunking-memory bounded to something sane
+# on the huge end of normal (kernel changelog.gz is a few MiB).
+GZIP_MAX_DECOMPRESSED = 16 * 1024 * 1024  # 16 MiB
+
+
 def _extract_non_text(path: Path, mime: str) -> Optional[str]:
     """Best-effort plaintext extraction for non-text MIME types."""
     if mime == "application/pdf":
@@ -319,6 +376,22 @@ def _extract_non_text(path: Path, mime: str) -> Optional[str]:
         return run(["pandoc", "--to=plain"], path)
     if mime.startswith("application/vnd.oasis"):
         return run(["pandoc", "--to=plain"], path)
+    if mime == "application/gzip":
+        # Stream-decompress with a hard cap. If the decompressed content
+        # is valid UTF-8 we index it as plaintext; anything else (binary
+        # tarballs, non-UTF-8 encodings) is skipped rather than guessed at.
+        import gzip as _gzip
+        try:
+            with _gzip.open(str(path), "rb") as f:
+                raw = f.read(GZIP_MAX_DECOMPRESSED + 1)
+        except Exception:
+            return None
+        if len(raw) > GZIP_MAX_DECOMPRESSED:
+            return None
+        try:
+            return raw.decode("utf-8") or None
+        except UnicodeDecodeError:
+            return None
     return None
 
 
@@ -344,28 +417,57 @@ def extract_chunks(path: Path, mime: str):
     for idx, (_, _, chunk_text) in enumerate(_chunk_bytes_utf8(raw)):
         yield idx, 0, size, chunk_text
 
-def extract_exif(path: Path, mime: str) -> dict:
-    """Extract EXIF/file metadata via exiftool as flat key:value dict.
+# Files per batched exiftool call. 50 is well under the shell ARG_MAX
+# and keeps each call's timeout (10 + N seconds) short enough that a
+# single hung file can't stall indexing for long.
+EXIF_BATCH = 50
 
-    Skipped for text/* and application/gzip — exiftool has no real
-    metadata to contribute there, and the subprocess cost dominates
-    indexing of text-heavy trees."""
-    if mime.startswith("text/") or mime == "application/gzip":
+
+_EXIFTOOL_SKIP_KEYS = {
+    "SourceFile", "ExifToolVersion", "Directory", "FileName",
+    "FilePermissions", "FileAccessDate", "FileInodeChangeDate",
+}
+
+
+def _wants_exif(mime: str) -> bool:
+    """Files where exiftool has no real metadata to contribute. Text and
+    gzip both fall out here — the subprocess cost would dominate
+    indexing of text-heavy trees with zero benefit."""
+    return not (mime.startswith("text/") or mime == "application/gzip")
+
+
+def batch_exiftool(paths: list[str]) -> dict[str, dict]:
+    """Run one exiftool invocation over many paths and return a
+    {path: {key: value}} map. Empty dict on total failure; a partial
+    parse still returns whatever succeeded.
+
+    Batching is the main win here: exiftool's startup (Perl interpreter +
+    its module graph) dominates per-file cost for small files. 50 paths
+    per call cuts fork/exec overhead ~50×."""
+    if not paths:
         return {}
     try:
         result = subprocess.run(
-            ["exiftool", "-json", "-fast", str(path)],
-            capture_output=True, text=True, timeout=15
+            ["exiftool", "-json", "-fast", "--", *paths],
+            capture_output=True, text=True,
+            # Startup budget + per-file budget. -fast skips slow probes.
+            timeout=10 + len(paths),
         )
-        data = json.loads(result.stdout)
-        if data:
-            # Drop noisy/path fields
-            skip = {"SourceFile", "ExifToolVersion", "Directory", "FileName",
-                    "FilePermissions", "FileAccessDate", "FileInodeChangeDate"}
-            return {k: str(v) for k, v in data[0].items() if k not in skip}
+        data = json.loads(result.stdout or "[]")
     except Exception:
-        pass
-    return {}
+        return {}
+    # SourceFile is what exiftool echoes back; because we always pass
+    # absolute paths in, the echo matches the input string exactly.
+    out: dict[str, dict] = {}
+    for entry in data:
+        src = entry.get("SourceFile")
+        if not src:
+            continue
+        out[src] = {
+            k: str(v) for k, v in entry.items()
+            if k not in _EXIFTOOL_SKIP_KEYS
+        }
+    return out
 
 # --- Indexing ---
 #
@@ -378,22 +480,21 @@ def extract_exif(path: Path, mime: str) -> dict:
 # no benefit to a second writer; the win is keeping the writer fed while
 # extraction runs on N cores.
 
-def _extract_for_index(path_str: str) -> dict:
-    """Worker function: all work that doesn't touch the DB. Runs in a
-    child process. Returns a dict that the writer consumes, or raises on
-    unexpected failure (the main loop catches and logs)."""
+def _extract_fast(path_str: str) -> dict:
+    """Pool worker: the work that doesn't need a subprocess and doesn't
+    touch the DB (stat, MIME, chunk extraction). EXIF is deliberately
+    NOT done here — it's batched across many files in the main loop, so
+    each worker returning quickly is what keeps the pool fed."""
     path = Path(path_str)
     stat = path.stat()
     mime = detect_mime(path)
     chunks = list(extract_chunks(path, mime))
-    exif = extract_exif(path, mime)
     return {
         "path": path_str,
         "mtime": stat.st_mtime,
         "size": stat.st_size,
         "mime": mime,
         "chunks": chunks,
-        "exif": exif,
     }
 
 
@@ -468,26 +569,56 @@ def index_tree(root: Path, fados_dir: Path, force: bool = False):
           file=sys.stderr)
     t0 = time.time()
     count = 0
+    skipped = 0
     errors = 0
+
+    pending: list[dict] = []
+    batches = 0
+
+    def flush_batch():
+        """Drain `pending`: one batched exiftool call over the files
+        that want it, then write everything to the DB. Files with no
+        chunks AND no exif are skipped entirely — they'd add a useless
+        row with no searchable content."""
+        nonlocal count, skipped
+        if not pending:
+            return
+        want = [d["path"] for d in pending if _wants_exif(d["mime"])]
+        exif_map = batch_exiftool(want)
+        for d in pending:
+            d["exif"] = exif_map.get(d["path"], {})
+            if not d["chunks"] and not d["exif"]:
+                skipped += 1
+                continue
+            _write_indexed(con, d)
+            count += 1
+        pending.clear()
+
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_extract_for_index, p): p for p in todo}
+        futures = {pool.submit(_extract_fast, p): p for p in todo}
         for fut in as_completed(futures):
             p = futures[fut]
             try:
-                _write_indexed(con, fut.result())
-                count += 1
-                if count % 1000 == 0:
-                    con.commit()
-                    elapsed = time.time() - t0
-                    print(f"  indexing: {count}/{len(todo)} ({elapsed:.0f}s)...",
-                          file=sys.stderr, flush=True)
+                pending.append(fut.result())
             except Exception as e:
                 errors += 1
                 print(f"  error: {p}: {e}", file=sys.stderr)
+                continue
+            if len(pending) >= EXIF_BATCH:
+                flush_batch()
+                batches += 1
+                if batches % 20 == 0:
+                    con.commit()
+                    elapsed = time.time() - t0
+                    print(f"  indexing: {count + skipped}/{len(todo)} "
+                          f"({elapsed:.0f}s)...", file=sys.stderr, flush=True)
+    flush_batch()
     con.commit()
     con.close()
     elapsed = time.time() - t0
     msg = f"indexed {count} files in {elapsed:.1f}s"
+    if skipped:
+        msg += f" ({skipped} skipped — no content)"
     if errors:
         msg += f" ({errors} errors)"
     print(msg, file=sys.stderr)
@@ -928,7 +1059,12 @@ def watch(root: Path, fados_dir: Path):
         path = Path(line.strip())
         if path.is_file():
             try:
-                _write_indexed(con, _extract_for_index(str(path)))
+                data = _extract_fast(str(path))
+                data["exif"] = (batch_exiftool([data["path"]]).get(data["path"], {})
+                                if _wants_exif(data["mime"]) else {})
+                if not data["chunks"] and not data["exif"]:
+                    continue
+                _write_indexed(con, data)
                 con.commit()
                 print(f"  reindexed: {path}")
             except Exception as e:
