@@ -74,12 +74,20 @@ def _should_ignore(rel_parts: tuple, include_hidden: bool,
 
     `rel_parts` is the path split into components *relative to the
     indexed root*, so a root like `~/.config` doesn't trigger the
-    hidden-dir filter on the root itself."""
+    hidden-dir filter on the root itself.
+
+    Dep dirs match either exactly (`node_modules`, `target`, ...) or by
+    substring for the `venv` family (`venv`, `.venv`, `venv-cpu`,
+    `myproj-venv`, ...) — there's enough variation in how projects name
+    their virtualenv dir that an enumerable set is doomed."""
     for part in rel_parts:
         if part in HARD_IGNORE_DIRS:
             return True
-        if not include_deps and part in DEP_DIRS:
-            return True
+        if not include_deps:
+            if part in DEP_DIRS:
+                return True
+            if "venv" in part:
+                return True
         if not include_hidden and part.startswith(".") and part not in (".", ".."):
             return True
     return False
