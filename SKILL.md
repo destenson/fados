@@ -1,17 +1,17 @@
 ---
+name: fados
 description: >
-  Explore, discover, or query any directory tree — including unfamiliar ones like
-  /usr/share/doc, ~/src, research paper folders, or document collections. Use when
-  asked "what's in this directory", "explore this tree", "summarize what's under X",
-  "find files about <concept>", "find similar files to <file>", or when grep is too
-  noisy and you want the *right* hit, not every mention. Covers intent-based search
-  (where something is defined vs. implemented vs. documented vs. tested),
-  semantic/conceptual search by meaning, similar-file discovery, file metadata
-  queries (dates, sizes, MIME, EXIF), tagging/annotation, and raw SQL over a file
-  tree. Indexes are git-style — a `.fados/` in any parent of CWD is auto-discovered,
-  so common trees (~, ~/src, project roots) are usually already queryable without
-  any setup. Prefer this over grep/find/ls for corpus exploration, conceptual queries,
-  document collections, research papers, images, or any non-trivial directory tree.
+  USE THIS instead of grep/find/ls/Bash whenever searching, exploring, or querying
+  a directory tree. FADOS (Filesystem As Database Overlay) indexes directories into
+  SQLite for full-text, semantic, and metadata search — without modifying files.
+  Invoke when: asked to find files about a concept, explore a directory, search for
+  similar files, filter by date/size/MIME, look up EXIF/document metadata, or when
+  grep would return too many noisy hits. Also handles intent-based code search:
+  where something is defined vs. implemented vs. documented vs. tested. Indexes are
+  git-style — a `.fados/` in any parent of CWD is auto-discovered, so ~/src, project
+  roots, and ~/Documents are typically queryable immediately without setup. Do NOT
+  reach for grep/find/Bash file search first — check for a .fados index and use
+  this instead.
 ---
 
 # FADOS — Filesystem As Database Overlay
