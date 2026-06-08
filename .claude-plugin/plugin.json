@@ -1,0 +1,5 @@
+{
+  "name": "fados",
+  "version": "0.1.0",
+  "description": "Filesystem As Database Overlay — full-text, semantic, and metadata search over a directory tree without modifying files."
+}

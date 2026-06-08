@@ -57,10 +57,11 @@ Do **not** use FADOS to read or write file content — use standard file tools f
 ## Running
 
 ```bash
-uv run scripts/fados.py <command> [args]
+uv run ${CLAUDE_PLUGIN_ROOT}/scripts/fados.py <command> [args]
 ```
 
-The script path is relative to this SKILL.md file.
+`${CLAUDE_PLUGIN_ROOT}` is the installed plugin directory; the fados script lives
+under `scripts/` within it. The examples below abbreviate this as `scripts/fados.py`.
 
 ---
 

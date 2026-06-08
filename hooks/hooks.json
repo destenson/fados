@@ -1,0 +1,16 @@
+{
+  "description": "Nudges search-shaped tool calls toward FADOS when a .fados index is discoverable from CWD.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/fados-nudge.py"
+          }
+        ]
+      }
+    ]
+  }
+}
