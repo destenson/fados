@@ -99,8 +99,21 @@ uv run scripts/fados.py query "SELECT path, mime FROM files WHERE mime = 'applic
 uv run scripts/fados.py find camera_model Sony
 
 # Tag and annotate files
+
+# Basic tagging – add simple, free‑form tags to a file
 uv run scripts/fados.py tag /path/to/file.md needs-review
+uv run scripts/fados.py tag /path/to/file.md urgent
+uv run scripts/fados.py tag /path/to/file.md draft
+
+# Structured annotation – attach key/value metadata useful for filtering
 uv run scripts/fados.py annotate /path/to/file.md project alpha
+uv run scripts/fados.py annotate /path/to/file.md author "Jane Doe"
+uv run scripts/fados.py annotate /path/to/file.md created "2026-06-08"
+uv run scripts/fados.py annotate /path/to/file.md source "github.com/example/repo"
+
+# Combining tags and metadata for richer queries
+uv run scripts/fados.py tag /path/to/report.pdf confidential
+uv run scripts/fados.py annotate /path/to/report.pdf department finance
 
 # Find where a function/class/type is defined
 uv run scripts/fados.py definition MyClass
