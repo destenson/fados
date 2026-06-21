@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "fados",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Marketplace hosting the FADOS filesystem-search plugin.",
   "owner": {
     "name": "Dennis E",
