@@ -1,11 +1,24 @@
-#!/usr/bin/env python3
+#!/bin/sh
+# Re-exec under the project's uv environment so the script runs from any
+# cwd, including via a symlink on PATH. `readlink -f "$0"` resolves the
+# symlink to the real file in scripts/; the project root (with pyproject
+# and .venv) is its parent. `uv run --project <root>` uses that env,
+# syncing it if stale, regardless of the cwd. The ''':' / ''' lines are a
+# no-op in sh but a discarded string in Python, so this header is valid
+# in both: sh hands the file to uv, and the resulting python skips back
+# here and parses the rest as normal Python.
+''':'
+exec uv run --project "$(dirname "$(readlink -f "$0")")/.." python "$0" "$@"
+'''
 """
 FADOS - Filesystem As Database Overlay System
-Single-file prototype. Run with: uv run scripts/fados.py <command> [args]
-
-Dependencies come from pyproject.toml. Semantic commands (embed,
-semantic, similar) additionally need the `semantic` extra:
-    uv sync --extra semantic
+Single-file prototype. Run it directly: ./scripts/fados.py <command>
+[args]. The header re-execs via `uv run --project <root>`, where <root>
+is the project dir holding this script (resolved relative to the real
+file), so it works from any directory and through a symlink on PATH — no
+.venv needed in the CWD. uv syncs the env from pyproject.toml as needed;
+add the `semantic` extra (`uv sync --extra semantic`) for the
+embed/semantic/similar commands.
 
 Auto-indexes CWD on first run. Index stored in <path>/.fados/index.db.
 Use --user for ~/.fados/ instead.
